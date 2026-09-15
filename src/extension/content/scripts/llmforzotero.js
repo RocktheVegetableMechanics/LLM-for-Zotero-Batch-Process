@@ -13707,17 +13707,27 @@ ${params.systemPrompt}` : DEFAULT_SYSTEM_PROMPT
   // src/agent/contracts/actionEvaluation.ts
   function evaluatePreparedActionContract(request, receipts) {
     const delegated = receipts.filter(
-      (receipt) => receipt.executionAuthority === "external_runtime"
+      (receipt) => receipt.executionAuthority === "external_runtime" && !(
+        receipt.status === "observed" && receipt.verification === "execution_only" && receipt.obligationId && receipts.some(
+          (proof) => receiptVerified(proof) && proof.obligationId === receipt.obligationId &&
+            receipt.requestedTargets?.length > 0 && receipt.requestedTargets.every(
+              (target) => [...proof.appliedTargets, ...proof.alreadySatisfiedTargets].includes(target)
+            )
+        )
+      )
     );
     if (delegated.length) {
-      if (delegated.every(receiptVerified)) return { state: "satisfied" };
-      const state2 = delegated.some((receipt) => receipt.status === "failed") ? "failed" : delegated.every((receipt) => receipt.status === "cancelled") ? "cancelled" : delegated.some(
-        (receipt) => receipt.status === "partial" || receiptVerified(receipt)
-      ) ? "partial" : "unverified";
-      return {
-        state: state2,
-        failure: formatDelegatedActionFailure(delegated)
-      };
+      if (delegated.every(receiptVerified) && !request.actionContract) return { state: "satisfied" };
+      if (!delegated.every(receiptVerified)) {
+        const state2 = delegated.some((receipt) => receipt.status === "failed") ? "failed" : delegated.every((receipt) => receipt.status === "cancelled") ? "cancelled" : delegated.some(
+          (receipt) => receipt.status === "partial" || receiptVerified(receipt)
+        ) ? "partial" : "unverified";
+        return {
+          state: state2,
+          failure: formatDelegatedActionFailure(delegated),
+          correction: state2 === "unverified" || state2 === "partial" ? "Completion verification recovery: preserve the existing answer. Do not repeat scripts or duplicate saved notes. Use semantic tools to inspect the exact requested outputs and satisfy only missing actions with host-verifiable receipts. Prefer paper_read/library_read for reading, note_write for requested note saves, and submit_document for a requested document. Privileged script execution alone cannot prove the requested outcome. If verification remains unavailable, report that limitation without discarding the analysis." : void 0
+        };
+    }
     }
     if (request.actionPreparation && request.actionPreparation.state !== "ready") {
       return {
@@ -150567,7 +150577,7 @@ Research identified the exact targets below. This approval authorizes only these
             const attemptStarted = Date.now();
             const result = await callSemanticCompletion(request, {
               prompt,
-              jsonBudget: 5e3,
+              jsonBudget: failureReason === "empty" || failureReason === "output_limit" ? 1e4 : 5e3,
               temperature: 0,
               signal: options.signal,
               timeoutMs: options.timeoutMs ?? TURN_INTENT_TIMEOUT_MS,
@@ -150587,6 +150597,9 @@ Research identified the exact targets below. This approval authorizes only these
               failureReason = result.reason;
               failureStatus = result.status;
               failureStage = "transport";
+              if (result.reason === "empty" || result.reason === "output_limit") {
+                prompt += "\nThe previous structured call produced no usable final JSON. Return the complete JSON object in the final answer channel; do not return only reasoning, commentary, tool calls, or an empty completion.";
+              }
               if (["not_configured", "aborted", "budget_unavailable"].includes(
                 result.reason
               ))
@@ -150721,7 +150734,7 @@ Workflow reference correction: ${error instanceof Error ? error.message : String
               skills: eligibleSkills,
               rejections: bindingIssues
             });
-            if (automatic.length !== router.selections.length) {
+            if (automatic.length !== router.selections.length && !(attempt > 0 && bindingIssues.length > 0 && bindingIssues.every((issue) => issue.reason === "scope_unavailable_in_current_context"))) {
               failureReason = "unparseable";
               failureStage = "skill_binding";
               failureDetail = `Skill binding rejected: ${JSON.stringify(bindingIssues)}`;
@@ -173414,6 +173427,7 @@ User request:
             canCorrect: true,
             successfulToolResultCount: successfulHostToolResults
           });
+          const answerBeforeVerification = result.text;
           const progress3 = scopedMcp?.getState()?.actionProgress;
           const corrections = [
             actionEvaluation.correction && (progress3?.correctionCount || 0) < 1 ? actionEvaluation.correction : "",
@@ -173467,7 +173481,7 @@ User request:
           if (verificationFailure) {
             result = {
               ...result,
-              text: verificationFailure,
+              text: answerBeforeVerification || result.text || verificationFailure,
               verificationFailure
             };
             await publishHost({
@@ -173479,9 +173493,7 @@ User request:
           if (document2) {
             result = {
               ...result,
-              text: verificationFailure ? `${document2.visibleMarkdown}
-
-${verificationFailure}` : document2.visibleMarkdown,
+              text: document2.visibleMarkdown,
               documentId: document2.documentId
             };
           }
@@ -204420,8 +204432,11 @@ Digest: ${snapshot2.digest}`;
     root.dataset.llmPlanDocumentId = params.documentId;
     root.textContent = "Loading document\u2026";
     let disposed = false;
+    let publicationTimer;
+    let publicationChecks = 0;
     cardDisposers.set(root, () => {
       disposed = true;
+      clearTimeout(publicationTimer);
     });
     const paint = (document2) => {
       root.replaceChildren();
@@ -204517,7 +204532,7 @@ Digest: ${snapshot2.digest}`;
       if (coverage) root.appendChild(coverage);
       params.onReady?.();
     };
-    void Promise.all([
+    const refreshPublication = () => Promise.all([
       loadPlanDocument(params.documentId),
       loadPlanDocumentOutbox(params.documentId)
     ]).then(([document2, outbox]) => {
@@ -204525,7 +204540,15 @@ Digest: ${snapshot2.digest}`;
       if (!document2) {
         root.textContent = "Document is unavailable";
       } else if (outbox?.status !== "delivered") {
-        root.textContent = "Publishing document\u2026";
+        root.textContent = outbox?.lastError || "Document saved; waiting for conversation publication.";
+        if (++publicationChecks < 30) {
+          publicationTimer = setTimeout(refreshPublication, 1000);
+        } else {
+          const retry = params.doc.createElement("button");
+          retry.textContent = "Refresh publication status";
+          retry.addEventListener("click", () => { publicationChecks = 0; void refreshPublication(); });
+          root.append(retry);
+        }
       } else {
         paint(document2);
       }
@@ -204533,6 +204556,7 @@ Digest: ${snapshot2.digest}`;
       if (!disposed && root.isConnected)
         root.textContent = error instanceof Error ? error.message : String(error);
     });
+    void refreshPublication();
     return root;
   }
   function disposeAgentTrace(root) {
