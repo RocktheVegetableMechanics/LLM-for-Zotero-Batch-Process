@@ -1,6 +1,6 @@
 import fs from 'node:fs';import vm from 'node:vm';import assert from 'node:assert/strict';
 const src=fs.readFileSync(new URL('../src/extension/content/scripts/llmforzotero.js',import.meta.url),'utf8');
-const start=src.indexOf('  function createSequentialPaperBatch('),end=src.indexOf('  // src/modules/contextPanel/setupHandlers/controllers/sendFlowController.ts',start);
+const start=src.indexOf('  function createRetryablePersistence('),end=src.indexOf('  // src/modules/contextPanel/setupHandlers/controllers/sendFlowController.ts',start);
 const batchCode=src.slice(start,end);
 const tick=()=>new Promise(r=>setImmediate(r));
 const ctx=vm.createContext({});vm.runInContext(batchCode,ctx);
@@ -24,10 +24,14 @@ const observers=new Map();let observerId=0;
 const prefs={registerObserver:(key,callback)=>{observers.set(++observerId,{key,callback});return observerId;},unregisterObserver:id=>observers.delete(id)};
 const refresh=async()=>{for(const observer of observers.values())observer.callback();await tick();};
 // Deliberately omit structuredClone: the add-on script sandbox does not supply DOM globals.
-doc.defaultView={MutationObserver:class {observe(){} disconnect(){}}};
+const windowListeners = new Map();
+doc.defaultView={MutationObserver:class {observe(){} disconnect(){}},
+ addEventListener(name,fn){if(!windowListeners.has(name))windowListeners.set(name,new Set());windowListeners.get(name).add(fn);},
+ removeEventListener(name,fn){windowListeners.get(name)?.delete(fn);}};
 let runtimeModel='gpt-5.6-luna',runtimeEffort='max';
 const remembered=new Map();let omitSavedAnswer=false;
 const runtime=vm.createContext({
+ IOUtils:{exists:async()=>false,makeDirectory:async()=>{},writeUTF8:async()=>{}},
  getCodexRuntimeModelPref:()=>runtimeModel,getCodexReasoningModePref:()=>runtimeEffort,
  setCodexRuntimeModelPref:m=>runtimeModel=m,setCodexReasoningModePref:e=>runtimeEffort=e,
  getConfiguredCodexAppServerBinaryPath:()=>'',
@@ -35,7 +39,7 @@ const runtime=vm.createContext({
  CODEX_APP_SERVER_GROUP_ID:'codex_app_server',CODEX_APP_SERVER_PROVIDER_LABEL:'Codex',DEFAULT_TEMPERATURE:1,CODEX_REASONING_OPTIONS:['low','max'],
  touchCodexConversationTitle:async()=>{},setLastUsedCodexPaperConversationKey:(l,p,k)=>remembered.set(p,k),activeCodexPaperConversationByPaper:new Map(),buildCodexPaperStateKey:(l,p)=>`${l}:${p}`,
  PERSISTED_HISTORY_LIMIT:100,loadStoredConversationByKey:async key=>{const call=calls.find(c=>c.item.id===key);return call?[{role:'user',text:call.question},...omitSavedAnswer?[]:[{role:'assistant',text:'Stored answer'}]]:[]},
- Zotero:{Prefs:prefs,getMainWindow:()=>({document:doc}),getActiveZoteroPane:()=>({getSelectedItems:()=>selected}),Items:{get:id=>items.get(id)}},
+ Zotero:{Profile:{dir:"test-profile"},Prefs:prefs,getMainWindow:()=>({document:doc}),getActiveZoteroPane:()=>({getSelectedItems:()=>selected}),Items:{get:id=>items.get(id)}},
  config:{prefsPrefix:'test'},MAX_EDITABLE_SHORTCUTS:20,migrateShortcutDefaultsIfNeeded:()=>{},getShortcutOverrides:()=>overrides,getShortcutLabelOverrides:()=>labels,getDeletedShortcutIds:()=>deleted,getShortcutOrder:()=>order,
  normalizeShortcutOrderForVisibleIds:(saved,ids)=>[...saved.filter(id=>ids.includes(id)),...ids.filter(id=>!saved.includes(id))],
  loadShortcutText:async file=>fs.readFileSync(new URL('../src/extension/content/shortcuts/'+file,import.meta.url),'utf8'),
@@ -114,24 +118,41 @@ const liveJobs=[{id:1,state:'queued'}],liveSeen=[];let liveRelease;const liveHol
 const liveQueue=ctx.createSequentialPaperBatch(liveJobs,async j=>{liveSeen.push(j.id);if(j.id===1)await liveHold;return {status:'completed'};});
 const liveRun=liveQueue.run();liveJobs.push({id:2,state:'queued'});liveRelease();await liveRun;
 assert.deepEqual(liveSeen,[1,2],'running queue consumes later additions in order');
-button('关闭').events.click();assert.equal(observers.size,0,'observers released on close');
+await button('关闭').events.click();assert.equal(observers.size,0,'observers released on close');
 // Stop has a real effect even before the first Start; requeue permits explicit restart.
 runtime.openSequentialPaperBatch(profile,papers[0]);await tick();
 const next=doc.documentElement.children.at(-1),nextButton=text=>next.children.find(e=>e.tag==='button'&&e.textContent===text);
 nextButton('停止当前及后续').events.click();assert.ok(next.children.find(e=>e.tag==='ol').children[0].children[0].textContent.startsWith('已停止'));
 next.children.find(e=>e.tag==='ol').children[0].children.find(e=>e.textContent==='重新排队').events.click();
 await nextButton('开始 / 继续').events.click();assert.ok(next.children.find(e=>e.tag==='ol').children[0].children[0].textContent.startsWith('完成'));
-nextButton('关闭').events.click();
+await nextButton('关闭').events.click();
 // Exercise the dialog's real Stop handler while sendQuestion is still pending.
 selected=[papers[0],papers[1]];let abortCalls=0,releaseActive;
 runtime.sendQuestion=async opts=>{calls.push(opts);return await new Promise(resolve=>releaseActive=resolve);};
 runtime.getAbortController2=()=>({abort(){abortCalls++;releaseActive({status:'cancelled',detail:'explicit stop'});}});
 runtime.openSequentialPaperBatch(profile);await tick();
 const active=doc.documentElement.children.at(-1),activeButton=text=>active.children.find(e=>e.tag==='button'&&e.textContent===text);
+assert.equal(activeButton('新建队列').disabled,true,'pending tasks cannot be discarded by starting a new queue');
 const activeRun=activeButton('开始 / 继续').events.click();await tick();
 const beforeDoubleClick=calls.length;await activeButton('开始 / 继续').events.click();assert.equal(calls.length,beforeDoubleClick,'double start does not duplicate a running request');
 activeButton('停止当前及后续').events.click();await activeRun;
 assert.equal(abortCalls,1,'Stop calls the active conversation abort controller');
 assert.ok(active.children.find(e=>e.tag==='ol').children.every(e=>e.children[0].textContent.startsWith('已停止')));
-activeButton('关闭').events.click();
+activeButton('新建队列').events.click();
+assert.equal(active.children.find(e=>e.tag==='ol').children.length,0);
+assert.equal(active.children.find(e=>e.tag==='textarea').disabled,false,'new batch can choose a new prompt');
+await activeButton('关闭').events.click();
+// Closing the main host must abort an active request as well as remove observers.
+runtime.openSequentialPaperBatch(profile,papers[0]);await tick();
+const unloading=doc.documentElement.children.at(-1);
+const unloadRun=unloading.children.find(e=>e.textContent==='开始 / 继续').events.click();await tick();
+const abortsBeforeUnload=abortCalls;
+for(const fn of [...windowListeners.get('unload')]) {
+ if(windowListeners.get('unload').has(fn))fn();
+}
+await unloadRun;
+assert.equal(abortCalls,abortsBeforeUnload+1,'main host unload does not remove its abort listener before dispatch');
+assert.equal(observers.size,0,'unload releases shortcut observers');
+assert.equal(windowListeners.get('unload').size,0,'unload releases window listeners');
 console.log('PASS: whole-job FIFO, pause/resume, failure isolation, stop pending; dialog preset expansion, selected-paper snapshot/deduplication, independent conversations, per-paper attachments, frozen prompt/model/reasoning. Zotero/model and DOM are simulated.');
+

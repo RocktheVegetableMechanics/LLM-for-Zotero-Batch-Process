@@ -32360,6 +32360,11 @@ ${pendingStdout}` : ""}`;
                 });
               }).finally(() => {
                 request.pending = false;
+            // A submitted answer is transport activity too. Reset the idle
+            // timeout before a timer from the waiting period can expire.
+            for (const handler of this.activityHandlers) {
+              try { handler(); } catch { /* observers cannot break the reply */ }
+            }
               });
               return;
             }
@@ -206584,10 +206589,7 @@ ${summary}` : ""
         return;
       }
     }
-    let assistantPersisted = false;
-    const persistAssistantOnce = async () => {
-      if (assistantPersisted) return;
-      assistantPersisted = true;
+    const persistAssistantOnce = createRetryablePersistence(async () => {
       const persistedTimestamp = refreshAssistantMessageTimestampForPersistence(
         assistantMessage,
         userMessage
@@ -206609,7 +206611,7 @@ ${summary}` : ""
         contextWindow: snapshot2?.contextWindow,
         quoteCitations: assistantMessage.quoteCitations
       });
-    };
+    });
     const markCancelled = async () => {
       flushMessageDeltas("cancel");
       deps.finalizeCancelledAssistantMessage(assistantMessage);
@@ -207010,10 +207012,7 @@ ${summary}` : ""
       releaseRequest();
       return;
     }
-    let assistantPersisted = false;
-    const persistAssistantOnce = async () => {
-      if (assistantPersisted) return;
-      assistantPersisted = true;
+    const persistAssistantOnce = createRetryablePersistence(async () => {
       const persistedTimestamp = refreshAssistantMessageTimestampForPersistence(
         assistantMessage,
         retryPair.userMessage
@@ -207034,7 +207033,7 @@ ${summary}` : ""
         contextWindow: snapshot2?.contextWindow,
         quoteCitations: assistantMessage.quoteCitations
       });
-    };
+    });
     const markCancelled = async () => {
       flushMessageDeltas("cancel");
       deps.finalizeCancelledAssistantMessage(assistantMessage);
@@ -217478,11 +217477,8 @@ ${snapshot2.text}
     }
     const { refreshChatSafely, refreshAssistantMessageSafely, setStatusSafely } = createPanelUpdateHelpers(body, item, conversationKey, ui);
     refreshChatSafely();
-    let assistantPersisted = false;
     let codexActivityTrace = null;
-    const persistAssistantOnce = async (status) => {
-      if (assistantPersisted) return;
-      assistantPersisted = true;
+    const persistAssistantOnce = createRetryablePersistence(async (status) => {
       if (!shouldPersistTurn) return;
       await codexActivityTrace?.persist(
         conversationKey,
@@ -217518,7 +217514,7 @@ ${snapshot2.text}
         },
         effectiveStorageSystem
       );
-    };
+    });
     let responseStreamCoalescer = null;
     const flushResponseStream = (reason) => {
       responseStreamCoalescer?.flushNow(reason);
@@ -221992,7 +221988,58 @@ ${reasoningHint}` : reasoningLabel;
   });
 
   // Sequential paper batches own their execution panels; reader tab lifecycle cannot rebind them.
-  function createSequentialPaperBatch(jobs, execute, changed = () => {}) {
+  function createRetryablePersistence(save) {
+    let saved = false, pending;
+    return (...args) => {
+      if (saved) return Promise.resolve();
+      if (pending) return pending;
+      pending = Promise.resolve().then(() => save(...args)).then(() => { saved = true; }).finally(() => { pending = undefined; });
+      return pending;
+    };
+  }
+  function encodePaperBatch(state) {
+    return JSON.stringify({version:1, prompt:String(state.prompt || ""), model:String(state.model || ""), effort:String(state.effort || ""), jobs:state.jobs.map(job => ({
+      id:job.id, libraryID:job.libraryID, itemKey:job.itemKey || "", title:String(job.title || ""), state:job.state,
+      detail:job.state === "running" ? "" : String(job.detail || ""), conversationKey:job.conversationKey,
+      model:job.model, effort:job.effort
+    }))});
+  }
+  function decodePaperBatch(text) {
+    if (text === null) return null;
+    const state = JSON.parse(text);
+    if (state.version !== 1 || !Array.isArray(state.jobs) || typeof state.prompt !== "string" || typeof state.model !== "string" || typeof state.effort !== "string") throw new Error("队列文件格式不受支持；原文件已保留");
+    for (const job of state.jobs) {
+      if (!Number.isSafeInteger(job.id) || job.id <= 0 || !Number.isSafeInteger(job.libraryID) || job.libraryID <= 0 || !["queued","running","completed","failed","blocked","cancelled","interrupted"].includes(job.state)) throw new Error("队列条目损坏；原文件已保留");
+      if (job.state === "running") { job.state = "interrupted"; job.detail = "上次运行中断，请先打开会话检查；确认需要重做时再重新排队。"; }
+    }
+    return state;
+  }
+  function createPaperBatchStore(read, write) {
+    let pending = Promise.resolve(), lastSaved;
+    return {
+      async load() { const raw = await read(); const value = decodePaperBatch(raw); lastSaved = raw; return value; },
+      save(state) {
+        const text = encodePaperBatch(state);
+        pending = pending.catch(() => {}).then(async () => { if (text !== lastSaved) { await write(text); lastSaved = text; } });
+        return pending;
+      },
+      flush() { return pending; }
+    };
+  }
+  function createZoteroPaperBatchStore() {
+    const win = Zotero.getMainWindow();
+    const io = globalThis.IOUtils || win?.IOUtils;
+    const root = Zotero.Profile?.dir;
+    if (!io || !root) throw new Error("无法访问 Zotero 队列存储目录");
+    const separator = root.includes("\\") ? "\\" : "/";
+    const directory = root.replace(/[\\/]$/, "") + separator + "llmforzotero";
+    const path = directory + separator + "paper-batch-v1.json";
+    return createPaperBatchStore(async () => await io.exists(path) ? io.readUTF8(path) : null, async text => {
+      await io.makeDirectory(directory, {createAncestors:true,ignoreExisting:true});
+      await io.writeUTF8(path, text, {tmpPath:path + ".tmp"});
+    });
+  }
+  function createSequentialPaperBatch(jobs, execute, changed = () => {}, checkpoint = async () => {}) {
     let running = false, paused = false, stopped = false;
     return {
       jobs,
@@ -222006,6 +222053,8 @@ ${reasoningHint}` : reasoningLabel;
             if (paused || stopped) break;
             if (job.state !== "queued") continue;
             job.state = "running"; changed();
+            try { await checkpoint(); } catch (error) { job.state = "queued"; paused = true; throw error; }
+            if (stopped || paused) { job.state = stopped ? "cancelled" : "queued"; await checkpoint(); break; }
             try {
               const outcome = await execute(job);
               job.state = outcome?.status || "blocked";
@@ -222014,9 +222063,8 @@ ${reasoningHint}` : reasoningLabel;
               job.state = error?.name === "AbortError" ? "cancelled" : "failed";
               job.detail = String(error?.message || error);
             }
-            // Each paper owns a separate request and conversation. Preserve its
-            // failure, then continue; only an explicit pause/stop halts the queue.
             changed();
+            try { await checkpoint(); } catch (error) { paused = true; throw error; }
           }
         } finally { running = false; changed(); }
       },
@@ -222054,7 +222102,7 @@ ${reasoningHint}` : reasoningLabel;
       paperBatchDialog.reveal();
       return;
     }
-    const doc = hostDocument || Zotero.getMainWindow().document;
+    const doc = Zotero.getMainWindow()?.document || hostDocument;
     const win = doc.defaultView || Zotero.getMainWindow();
     const make = (tag, text) => { const el = doc.createElementNS("http://www.w3.org/1999/xhtml", tag); if (text) el.textContent = text; return el; };
 
@@ -222101,8 +222149,8 @@ ${reasoningHint}` : reasoningLabel;
       } catch (error) { notice.textContent = "模型目录读取失败，可使用已选模型或点击刷新重试：" + String(error?.message || error); }
       finally { catalogLoading = false; reloadModels.textContent = "刷新模型"; render(); }
     };
-    modelSelect.addEventListener("change", () => { selectedModel = modelSelect.value; rebuildModels(); setCodexRuntimeModelPref(selectedModel); setCodexReasoningModePref(selectedEffort); });
-    reasoningSelect.addEventListener("change", () => { selectedEffort = reasoningSelect.value; setCodexReasoningModePref(selectedEffort); });
+    modelSelect.addEventListener("change", () => { selectedModel = modelSelect.value; rebuildModels(); setCodexRuntimeModelPref(selectedModel); setCodexReasoningModePref(selectedEffort); persistChanged(); });
+    reasoningSelect.addEventListener("change", () => { selectedEffort = reasoningSelect.value; setCodexReasoningModePref(selectedEffort); persistChanged(); });
     reloadModels.addEventListener("click", () => { void refreshModels(); });
     let initialChoices = true;
     const refreshPrompts = async () => {
@@ -222133,15 +222181,28 @@ ${reasoningHint}` : reasoningLabel;
       void Promise.resolve().then(() => { refreshScheduled = false; return refreshPrompts(); });
     };
     const promptObservers = [];
-    const cleanupPrompts = () => { ++refreshGeneration; for (const id of promptObservers.splice(0)) Zotero.Prefs.unregisterObserver(id); win.removeEventListener?.("unload", cleanupPrompts); };
-    presets.addEventListener("change", () => { const chosen = shortcuts.find(s => s.id === presets.value); if (chosen && !submittedPrompt) prompt.value = chosen.prompt; });
+    const cleanupPrompts = () => { ++refreshGeneration; for (const id of promptObservers.splice(0)) Zotero.Prefs.unregisterObserver(id); win.removeEventListener?.("unload", cleanupPrompts); win.removeEventListener?.("unload", onBatchUnload); };
+    presets.addEventListener("change", () => { const chosen = shortcuts.find(s => s.id === presets.value); if (chosen && !submittedPrompt) { prompt.value = chosen.prompt; persistChanged(); } });
+    prompt.addEventListener("change", () => persistChanged());
     const start = make("button", "开始 / 继续"), pause = make("button", "本篇完成后暂停"), stop = make("button", "停止当前及后续"), close = make("button", "关闭"), collapse = make("button", "收起");
+    const resetQueue = make("button", "新建队列");
     const status = make("p"), list = make("ol"), worker = make("div");
     status.setAttribute("role", "status"); status.setAttribute("aria-live", "polite");
     worker.hidden = true;
     const jobs = [];
     let batch, currentKey, submittedPrompt, submittedProfile, currentCancelled = false;
-    const labels = {queued:"等待",running:"处理中",completed:"完成",failed:"失败",blocked:"未完成",cancelled:"已停止"};
+    let loadingQueue = true, starting = false, storageError = "", loadError = "", store;
+    const snapshot = () => ({jobs, prompt:submittedPrompt || prompt.value, model:selectedModel, effort:selectedEffort});
+    const checkpoint = async () => {
+      if (loadingQueue || loadError || !store) throw new Error(loadError || "队列存储尚未就绪");
+      try { await store.save(snapshot()); storageError = ""; }
+      catch (error) { storageError = String(error?.message || error); throw error; }
+    };
+    const persistChanged = () => { if (!loadingQueue && !loadError && store) void checkpoint().catch(() => {
+      notice.textContent = "队列保存失败，已暂停：" + storageError;
+      if (batch && !batch.paused) batch.pause();
+    }); };
+    const labels = {queued:"等待",running:"处理中",completed:"完成",failed:"失败",blocked:"未完成",cancelled:"已停止",interrupted:"中断待确认"};
     const render = () => {
       list.replaceChildren();
       for (const job of jobs) {
@@ -222152,7 +222213,7 @@ ${reasoningHint}` : reasoningLabel;
           remove.addEventListener("click", () => { if (job.state !== "queued") return; const index = jobs.indexOf(job); if (index >= 0) jobs.splice(index, 1); render(); });
           row.append(remove);
         }
-        if (["failed","blocked","cancelled"].includes(job.state)) {
+        if (["failed","blocked","cancelled","interrupted"].includes(job.state)) {
           const retry = make("button", "重新排队"); retry.disabled = Boolean(batch?.running);
           retry.addEventListener("click", () => { if (batch?.running) return; job.state = "queued"; job.detail = ""; render(); }); row.append(retry);
         }
@@ -222163,21 +222224,23 @@ ${reasoningHint}` : reasoningLabel;
         list.append(row);
       }
       status.textContent = `${batch?.running ? (batch.paused ? "本篇结束后暂停。" : "队列正在执行。") : batch?.paused ? "队列已暂停。" : jobs.length && !jobs.some(j => j.state === "queued") ? "本轮队列已结束。" : "队列就绪。"}完成 ${jobs.filter(j => j.state === "completed").length}/${jobs.length}；失败或未完成 ${jobs.filter(j => ["failed","blocked"].includes(j.state)).length}；等待 ${jobs.filter(j => j.state === "queued").length}。结果和错误可通过“打开论文会话”访问；失败项可重新排队。`;
-      close.disabled = Boolean(batch?.running); start.disabled = Boolean(batch?.running) || !jobs.some(job => job.state === "queued");
+      close.disabled = Boolean(batch?.running); start.disabled = loadingQueue || Boolean(loadError) || starting || Boolean(batch?.running) || !jobs.some(job => job.state === "queued");
+      resetQueue.disabled = loadingQueue || Boolean(loadError) || starting || Boolean(batch?.running) || jobs.some(job => ["queued","running","interrupted"].includes(job.state));
       pause.disabled = !batch?.running || batch.paused;
       stop.disabled = !batch?.running && !jobs.some(job => job.state === "queued");
       modelSelect.disabled = reasoningSelect.disabled = Boolean(batch?.running);
-      reloadModels.disabled = catalogLoading || Boolean(batch?.running);
+      reloadModels.disabled = loadingQueue || catalogLoading || Boolean(batch?.running);
+      persistChanged();
     };
     panel.addPapers = items => {
-      const normalized = normalizeBatchPapers(items), known = new Set(jobs.map(job => job.id));
+      const normalized = normalizeBatchPapers(items), known = new Set(jobs.map(job => job.libraryID + ":" + job.id));
       let added = 0;
       for (const paper of normalized) {
-        if (known.has(paper.id)) continue;
-        known.add(paper.id); added++;
-        jobs.push({id:paper.id,libraryID:paper.libraryID,title:String(paper.getField("title")),state:"queued"});
+        if (known.has(paper.libraryID + ":" + paper.id)) continue;
+        known.add(paper.libraryID + ":" + paper.id); added++;
+        jobs.push({id:paper.id,libraryID:paper.libraryID,itemKey:paper.key,title:String(paper.getField("title")),state:"queued"});
       }
-      if (batch?.stopped && !batch.running && added) batch = createSequentialPaperBatch(jobs, execute, render);
+      if (batch?.stopped && !batch.running && added) batch = createSequentialPaperBatch(jobs, execute, render, checkpoint);
       notice.textContent = normalized.length ? "新增 " + added + " 篇；跳过 " + (normalized.length-added) + " 篇重复文献。队列共 " + jobs.length + " 篇。" + (batch?.running ? "新增论文将按顺序接着处理。" : "点击“开始 / 继续”处理待执行论文。") + (submittedPrompt ? "沿用本队列已确认的提示词；模型按开始时的选项执行。" : "") : "没有可添加的论文。请在 Zotero 文献列表选中条目，或从论文对话点击“加入批量队列”。";
       render();
     };
@@ -222193,10 +222256,12 @@ ${reasoningHint}` : reasoningLabel;
       currentCancelled = false;
       job.model = submittedProfile.model; job.effort = submittedProfile.reasoningMode; job.detail = "正在创建论文会话…"; render();
       const paper = Zotero.Items.get(job.id);
-      if (!paper || paper.deleted || paper.libraryID !== job.libraryID) throw new Error("文献已删除或所属文库已改变");
+      if (!paper || paper.deleted || paper.libraryID !== job.libraryID || (job.itemKey && job.itemKey !== paper.key)) throw new Error("文献已删除或所属文库已改变");
       const summary = await createCodexPaperConversation(job.libraryID, job.id);
       if (!summary) throw new Error("无法创建论文会话");
       job.conversationKey = summary.conversationKey;
+      await checkpoint();
+      if (currentCancelled) return {status:"cancelled",detail:"在准备期间停止"};
       await touchCodexConversationTitle(summary.conversationKey, "批量 · " + (shortcuts.find(s => s.id === presets.value)?.label || submittedPrompt));
       const item = createCodexPaperPortalItem(paper, summary.conversationKey);
       await ensureConversationLoaded(item);
@@ -222229,7 +222294,8 @@ ${reasoningHint}` : reasoningLabel;
       } finally { statusObserver.disconnect(); currentKey = null; clearPanelHostBinding(worker); worker.replaceChildren(); }
     };
     start.addEventListener("click", async () => {
-      if (batch?.running) return;
+      if (batch?.running || starting || loadingQueue || loadError) return;
+      starting = true;
       try {
         if (!jobs.some(job => job.state === "queued")) { notice.textContent = "没有等待执行的论文。请添加文献或将失败项重新排队。"; return; }
         if (!prompt.value.trim()) { notice.textContent = "请填写提示词正文。"; return; }
@@ -222238,20 +222304,27 @@ ${reasoningHint}` : reasoningLabel;
         submittedProfile = {...entry,reasoning:buildCodexAppServerReasoningConfig(selectedEffort),reasoningMode:selectedEffort};
         submittedPrompt = submittedPrompt || prompt.value.trim();
         prompt.disabled = presets.disabled = true;
-        if (!batch || batch.stopped) batch = createSequentialPaperBatch(jobs,execute,render);
+        if (!batch || batch.stopped) batch = createSequentialPaperBatch(jobs,execute,render,checkpoint);
         notice.textContent = "已开始：" + selectedModel + " / " + selectedEffort + "。正在准备第一篇待执行论文。";
         await batch.run();
       } catch (error) { notice.textContent = "启动或执行失败：" + String(error?.message || error); }
-      finally { render(); }
+      finally { starting = false; render(); }
+    });
+    resetQueue.addEventListener("click", () => {
+      if (resetQueue.disabled) return;
+      jobs.splice(0); batch = undefined; submittedPrompt = undefined;
+      prompt.disabled = presets.disabled = false;
+      notice.textContent = "已新建队列。历史回答仍保存在各篇论文会话中；请选择提示词并添加论文。";
+      render();
     });
     pause.addEventListener("click", () => { batch?.pause(); notice.textContent = "已请求暂停，本篇完成后停止领取下一篇。"; });
     stop.addEventListener("click", () => {
       currentCancelled = true;
-      if (!batch) batch = createSequentialPaperBatch(jobs,execute,render);
+      if (!batch) batch = createSequentialPaperBatch(jobs,execute,render,checkpoint);
       batch.stop(); if (currentKey) getAbortController2(currentKey)?.abort();
       notice.textContent = "已请求停止当前及后续论文；已有会话保留，可将停止项重新排队。";
     });
-    close.addEventListener("click", () => { if (!batch?.running) { batch?.stop(); cleanupPrompts(); panel.remove(); paperBatchDialog = null; } });
+    close.addEventListener("click", async () => { if (!batch?.running && !starting && !loadingQueue) { try { batch?.pause(); if (!loadError) await checkpoint(); cleanupPrompts(); panel.remove(); paperBatchDialog = null; } catch (error) { notice.textContent = "无法保存队列，请保持窗口打开：" + String(error?.message || error); } } });
     let collapsed = false, expandedGeometry;
     const setCollapsed = value => {
       collapsed = value;
@@ -222279,12 +222352,43 @@ ${reasoningHint}` : reasoningLabel;
     });
     const endDrag = () => { drag = null; };
     title.addEventListener("pointerup", endDrag); title.addEventListener("pointercancel", endDrag);
-    panel.append(title,help,addSelected,dropZone,notice,settings,presets,prompt,start,pause,stop,close,collapse,status,list,worker);
-    doc.documentElement.append(panel); panel.addPapers(papers);
+    panel.append(title,help,addSelected,dropZone,notice,settings,presets,prompt,start,pause,stop,resetQueue,close,collapse,status,list,worker);
+    doc.documentElement.append(panel);
+    win.focus?.();
+    const incomingPapers = [...papers];
+    const addPapersNow = panel.addPapers;
+    panel.addPapers = items => { if (loadingQueue) incomingPapers.push(...items); else addPapersNow(items); };
+    void (async () => {
+      try {
+        store = createZoteroPaperBatchStore();
+        const saved = await store.load();
+        if (saved) {
+          jobs.push(...saved.jobs); prompt.value = saved.prompt;
+          submittedPrompt = saved.jobs.some(job => job.conversationKey) ? saved.prompt : undefined;
+          if (saved.model) selectedModel = saved.model;
+          if (saved.effort) selectedEffort = saved.effort;
+          if (submittedPrompt) prompt.disabled = presets.disabled = true;
+          batch = createSequentialPaperBatch(jobs,execute,render,checkpoint); batch.pause();
+          notice.textContent = "已恢复队列，当前暂停。中断项请先检查会话再决定是否重新排队。";
+        }
+        loadingQueue = false;
+        if (incomingPapers.length) addPapersNow(incomingPapers);
+        rebuildModels(); render();
+      } catch (error) { loadingQueue = false; loadError = String(error?.message || error); notice.textContent = "队列读取失败，原文件保留：" + loadError; render(); }
+    })();
     for (const key of ["shortcuts", "shortcutLabels", "shortcutDeleted", "customShortcuts", "shortcutOrder"]) {
       promptObservers.push(Zotero.Prefs.registerObserver(config.prefsPrefix + "." + key, schedulePromptRefresh, true));
     }
-    win.addEventListener?.("unload", cleanupPrompts, {once:true});
+    const onBatchUnload = () => { cleanupPrompts(); batch?.pause(); currentCancelled = true; if (currentKey) getAbortController2(currentKey)?.abort(); persistChanged(); };
+    win.addEventListener?.("unload", onBatchUnload, {once:true});
+    panel.shutdown = async () => {
+      batch?.pause(); currentCancelled = true;
+      if (currentKey) getAbortController2(currentKey)?.abort();
+      if (!loadingQueue && !loadError) await checkpoint();
+      await store?.flush();
+      cleanupPrompts(); panel.remove(); paperBatchDialog = null;
+    };
+
     rebuildModels(); void refreshModels();
     void refreshPrompts();
 
@@ -262404,6 +262508,7 @@ ${t("Model connection was not tested.")}` : `${t("Test failed: ")}${err2 instanc
     win.document.getElementById("llmforzotero-key-standalone")?.remove();
   }
   async function onShutdown() {
+    await paperBatchDialog?.shutdown?.();
     zoteroChangeDispatcher.unregisterNativeObserver();
     await zoteroChangeDispatcher.flush();
     unregisterPaperConversationRestoreNotifications();
@@ -262505,3 +262610,4 @@ ${t("Model connection was not tested.")}` : `${t("Test failed: ")}${err2 instanc
     });
   }
 })();
+
