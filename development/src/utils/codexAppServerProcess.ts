@@ -1,0 +1,2673 @@
+import { createAbortController } from "./apiHelpers";
+import type {
+  ReasoningConfig,
+  ReasoningEvent,
+  UsageStats,
+} from "../shared/llm";
+import type {
+  CodexAppServerHistoryItem,
+  CodexAppServerUserInput,
+} from "./codexAppServerInput";
+import { getRuntimePlatformInfo } from "./runtimePlatform";
+import { getReasoningDefaultLevelForModel } from "./reasoningProfiles";
+import { extractContextCacheUsage } from "../contextCache/manager";
+import { appLogger } from "../core/logging";
+import {
+  LocalDocumentPathStreamRedactor,
+  redactAllRememberedLocalDocumentPathsFromTerminalText,
+  redactAllRememberedLocalDocumentPathsFromTerminalValue,
+} from "../agent/privacy/localDocumentPathRedaction";
+
+const DEFAULT_CODEX_APP_SERVER_TURN_TIMEOUT_MS = 300_000;
+const DEFAULT_CODEX_APP_SERVER_REQUEST_TIMEOUT_MS = 60_000;
+const CODEX_APP_SERVER_STDERR_TAIL_WAIT_MS = 100;
+const CODEX_APP_SERVER_DIAGNOSTIC_BUFFER_MAX = 4000;
+const CODEX_APP_SERVER_DIAGNOSTIC_BUFFER_TRIM_THRESHOLD = 8000;
+const CODEX_ENV_KEYS = [
+  "CODEX_PATH",
+  "HOME",
+  "USERPROFILE",
+  "NPM_CONFIG_PREFIX",
+  "npm_config_prefix",
+  "PREFIX",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "NVM_HOME",
+  "NVM_SYMLINK",
+  "NVM_DIR",
+  "PATH",
+  "Path",
+  "NO_PROXY",
+  "no_proxy",
+];
+const CODEX_LOOPBACK_NO_PROXY_ENTRIES = ["localhost", "127.0.0.1", "::1"];
+
+type PendingRequest = {
+  resolve: (value: unknown) => void;
+  reject: (reason: unknown) => void;
+};
+
+type ActivityHandler = () => void;
+type NotificationHandler = (params: unknown) => void;
+type RequestHandler = (
+  params: unknown,
+  id: string | number,
+  signal: AbortSignal,
+) => unknown | Promise<unknown>;
+
+type ServerRequest = {
+  handler: RequestHandler;
+  controller: AbortController;
+  method: string;
+  threadId?: string;
+  turnId?: string;
+  pending: boolean;
+};
+
+export type CodexAppServerItemEvent = {
+  id?: string;
+  type?: string;
+  role?: string;
+  status?: string;
+  summary?: string;
+  details?: string;
+  error?: string;
+  name?: string;
+  toolName?: string;
+  title?: string;
+  serverName?: string;
+  arguments?: unknown;
+  query?: string;
+  action?: unknown;
+  command?: string;
+  cwd?: string;
+  path?: string;
+  result?: unknown;
+  savedPath?: string;
+  revisedPrompt?: string;
+  exitCode?: number;
+  durationMs?: number;
+  changes?: unknown;
+  success?: boolean;
+  namespace?: string;
+  model?: string;
+  receiverThreadIds?: unknown;
+  raw?: Record<string, unknown>;
+};
+
+export type CodexAppServerAgentMessageDeltaEvent = {
+  itemId?: string;
+  delta: string;
+};
+
+export type CodexAppServerInjectItemsSupport =
+  | "unknown"
+  | "supported"
+  | "unsupported";
+
+export type CodexAppServerProcessOptions = {
+  codexPath?: string;
+};
+
+type CodexLaunchInvocation = {
+  command: string;
+  args: string[];
+  environment?: Record<string, string>;
+};
+
+function createAbortError(): Error {
+  const err = new Error("Aborted");
+  (err as { name?: string }).name = "AbortError";
+  return err;
+}
+
+function extractCodexAppServerNotificationThreadId(rawParams: unknown): string {
+  if (!rawParams || typeof rawParams !== "object") return "";
+  const params = rawParams as {
+    threadId?: unknown;
+    thread?: { id?: unknown };
+  };
+  if (typeof params.thread?.id === "string" && params.thread.id.trim()) {
+    return params.thread.id.trim();
+  }
+  if (typeof params.threadId === "string" && params.threadId.trim()) {
+    return params.threadId.trim();
+  }
+  return "";
+}
+
+export class CodexAppServerProcess {
+  private proc: unknown;
+  private nextId = 1;
+  private pendingRequests = new Map<number, PendingRequest>();
+  private activityHandlers = new Set<ActivityHandler>();
+  private notificationHandlers = new Map<string, Set<NotificationHandler>>();
+  private requestHandlers = new Map<string, Set<RequestHandler>>();
+  private serverRequests = new Map<string | number, ServerRequest>();
+
+  hasPendingUserInput(threadId?: string, turnId?: string): boolean {
+    return Array.from(this.serverRequests.values()).some(
+      (request) =>
+        request.pending &&
+        !request.controller.signal.aborted &&
+        (!threadId || request.threadId === threadId) &&
+        (!turnId || request.turnId === turnId) &&
+        (request.method.endsWith("/requestUserInput") ||
+          request.method.endsWith("/requestApproval") ||
+          request.method === "mcpServer/elicitation/request"),
+    );
+  }
+  private closeHandlers = new Set<() => void>();
+  private readLoopPromise: Promise<void> | null = null;
+  private stderrLoopPromise: Promise<void> | null = null;
+  private turnQueue = Promise.resolve();
+  private lineBuffer = "";
+  private diagnosticBuffer = "";
+  private readonly diagnosticStreamRedactor =
+    new LocalDocumentPathStreamRedactor(0, { allConversations: true });
+  private launchDescription = "";
+  private destroyed = false;
+  private didNotifyClose = false;
+  private injectItemsSupport: CodexAppServerInjectItemsSupport = "unknown";
+  private protocolInitialized = false;
+
+  private constructor(proc: unknown, launchDescription = "") {
+    this.proc = proc;
+    this.launchDescription = launchDescription;
+  }
+
+  static forTest(proc: unknown, launchDescription = ""): CodexAppServerProcess {
+    return new CodexAppServerProcess(proc, launchDescription);
+  }
+
+  static async loadSubprocessModule(): Promise<any> {
+    const CU = (globalThis as any).ChromeUtils;
+    let Subprocess: any;
+    if (CU?.importESModule) {
+      try {
+        const mod = CU.importESModule(
+          "resource://gre/modules/Subprocess.sys.mjs",
+        );
+        Subprocess = mod.Subprocess || mod.default || mod;
+      } catch {
+        /* fallback */
+      }
+    }
+    if (!Subprocess?.call && CU?.import) {
+      try {
+        const mod = CU.import("resource://gre/modules/Subprocess.jsm");
+        Subprocess = mod.Subprocess || mod;
+      } catch {
+        /* fallback */
+      }
+    }
+    if (!Subprocess?.call) {
+      throw new Error(
+        "Subprocess module not available in this Zotero environment",
+      );
+    }
+    return Subprocess;
+  }
+
+  static async spawn(
+    options: CodexAppServerProcessOptions = {},
+  ): Promise<CodexAppServerProcess> {
+    const Subprocess = await CodexAppServerProcess.loadSubprocessModule();
+    const info = getRuntimePlatformInfo();
+    const binary = await resolveCodexBinary(options.codexPath);
+
+    let command: string;
+    let args: string[];
+    let environment: Record<string, string> | undefined;
+    if (info.platform === "windows") {
+      const invocation = await buildWindowsCodexInvocation(binary, info);
+      command = invocation.command;
+      args = invocation.args;
+      environment = invocation.environment;
+    } else {
+      const invocation = await buildPosixCodexInvocation(binary, info);
+      command = invocation.command;
+      args = invocation.args;
+      environment = invocation.environment;
+    }
+    environment = buildCodexLaunchEnvironment(environment);
+    let proc: any;
+    try {
+      proc = await Subprocess.call({
+        command,
+        arguments: args,
+        stderr: "pipe",
+        ...(environment ? { environment, environmentAppend: true } : {}),
+      });
+    } catch (err) {
+      throw new Error(
+        `Failed to spawn codex app-server (command: ${command} ${args.join(" ")}): ${err instanceof Error ? err.message : JSON.stringify(err)}`,
+      );
+    }
+
+    const instance = new CodexAppServerProcess(
+      proc,
+      formatLaunchDescription(command, args),
+    );
+    instance.startReadLoop();
+    instance.startStderrReadLoop();
+    try {
+      await instance.initialize();
+      return instance;
+    } catch (error) {
+      // spawn() still owns the subprocess until initialization succeeds.
+      await instance.destroyAndWait().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private startReadLoop(): void {
+    const proc = this.proc as any;
+    this.readLoopPromise = (async () => {
+      while (!this.destroyed) {
+        let chunk: string;
+        try {
+          chunk = await proc.stdout.readString();
+        } catch {
+          break;
+        }
+        if (!chunk) break;
+        this.lineBuffer += chunk;
+        const lines = this.lineBuffer.split("\n");
+        this.lineBuffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            this.handleMessage(JSON.parse(trimmed));
+          } catch {
+            const redactedLine =
+              redactAllRememberedLocalDocumentPathsFromTerminalText(trimmed);
+            this.appendDiagnostic(`${redactedLine}\n`, "stdout");
+            appLogger.debug(
+              `[llm-for-zotero] codex app-server: failed to parse line: ${redactedLine}`,
+            );
+          }
+        }
+      }
+      if (!this.destroyed) {
+        await this.waitForStderrTail();
+        const diagnostics = this.getDiagnosticTail();
+        this.fail(
+          new Error(
+            `codex app-server process closed unexpectedly${diagnostics ? `: ${diagnostics}` : " with no stderr/stdout diagnostics"}${this.launchDescription ? ` (launched: ${this.launchDescription})` : ""}`,
+          ),
+          false,
+        );
+      }
+    })();
+  }
+
+  private startStderrReadLoop(): void {
+    const proc = this.proc as any;
+    if (!proc.stderr?.readString) return;
+    this.stderrLoopPromise = (async () => {
+      while (!this.destroyed) {
+        let chunk: string;
+        try {
+          chunk = await proc.stderr.readString();
+        } catch {
+          break;
+        }
+        if (!chunk) break;
+        this.appendDiagnostic(chunk, "stderr");
+      }
+    })();
+  }
+
+  private appendDiagnostic(chunk: string, channel: string): void {
+    this.diagnosticBuffer += this.diagnosticStreamRedactor.push(channel, chunk);
+    if (
+      this.diagnosticBuffer.length >
+      CODEX_APP_SERVER_DIAGNOSTIC_BUFFER_TRIM_THRESHOLD
+    ) {
+      this.diagnosticBuffer = this.diagnosticBuffer.slice(
+        -CODEX_APP_SERVER_DIAGNOSTIC_BUFFER_MAX,
+      );
+    }
+  }
+
+  private getDiagnosticTail(): string {
+    for (const entry of this.diagnosticStreamRedactor.flushAll()) {
+      this.diagnosticBuffer += entry.text;
+    }
+    const pendingStdout = redactAllRememberedLocalDocumentPathsFromTerminalText(
+      this.lineBuffer.trim(),
+    );
+    const combined = `${this.diagnosticBuffer}${pendingStdout ? `\n${pendingStdout}` : ""}`;
+    return redactAllRememberedLocalDocumentPathsFromTerminalText(combined)
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  private async waitForStderrTail(): Promise<void> {
+    if (!this.stderrLoopPromise) return;
+    await Promise.race([
+      this.stderrLoopPromise.catch(() => undefined),
+      new Promise<void>((resolve) =>
+        setTimeout(resolve, CODEX_APP_SERVER_STDERR_TAIL_WAIT_MS),
+      ),
+    ]);
+  }
+
+  private handleMessage(msg: Record<string, unknown>): void {
+    for (const handler of this.activityHandlers) {
+      try {
+        handler();
+      } catch {
+        /* ignore */
+      }
+    }
+
+    if ("id" in msg && msg.id !== null && msg.id !== undefined) {
+      const id = msg.id as string | number;
+      const pending =
+        typeof msg.method === "string"
+          ? undefined
+          : this.pendingRequests.get(id as number);
+      if (pending) {
+        this.pendingRequests.delete(id as number);
+        if ("error" in msg) {
+          pending.reject(
+            new Error(
+              redactAllRememberedLocalDocumentPathsFromTerminalText(
+                String((msg.error as any)?.message ?? msg.error),
+              ),
+            ),
+          );
+        } else {
+          pending.resolve(msg.result);
+        }
+        return;
+      }
+
+      if (typeof msg.method === "string") {
+        const handlers = this.requestHandlers.get(msg.method);
+        if (!handlers?.size) {
+          try {
+            appLogger.warn("Codex app-server: unhandled server request", {
+              method: msg.method,
+              params: redactAllRememberedLocalDocumentPathsFromTerminalValue(
+                msg.params,
+              ),
+            });
+          } catch {
+            /* diagnostics must not affect protocol responses */
+          }
+          this.writeRawMessage({
+            id,
+            error: {
+              code: -32601,
+              message: `No handler registered for ${msg.method}`,
+            },
+          });
+          return;
+        }
+        const handler = handlers.values().next().value as
+          | RequestHandler
+          | undefined;
+        if (!handler) return;
+        if (this.serverRequests.has(id)) return;
+        const identity = msg.params as
+          | { threadId?: string; turnId?: string }
+          | undefined;
+        const request: ServerRequest = {
+          handler,
+          controller: createAbortController(),
+          method: msg.method,
+          threadId: identity?.threadId,
+          turnId: identity?.turnId,
+          pending: true,
+        };
+        this.serverRequests.set(id, request);
+        Promise.resolve()
+          .then(() => handler(msg.params, id, request.controller.signal))
+          .then((result) => {
+            if (request.controller.signal.aborted) return;
+            this.writeRawMessage({ id, result });
+          })
+          .catch((error) => {
+            if (request.controller.signal.aborted) return;
+            this.writeRawMessage({
+              id,
+              error: {
+                code: -32000,
+                message: error instanceof Error ? error.message : String(error),
+              },
+            });
+          })
+          .finally(() => {
+            request.pending = false;
+            // A submitted answer is transport activity too. Reset the idle
+            // timeout before a timer from the waiting period can expire.
+            for (const handler of this.activityHandlers) {
+              try {
+                handler();
+              } catch {
+                /* observers cannot break the reply */
+              }
+            }
+          });
+        return;
+      }
+    } else if (typeof msg.method === "string") {
+      if (msg.method === "serverRequest/resolved") {
+        const event = msg.params as {
+          requestId: string | number;
+          threadId?: string;
+        };
+        const request = this.serverRequests.get(event.requestId);
+        if (request && event.threadId === request.threadId)
+          request.controller.abort();
+      }
+      if (msg.method === "turn/completed") {
+        const event = msg.params as {
+          threadId?: string;
+          turnId?: string;
+          turn?: { id?: string };
+        };
+        const turnId = event.turn?.id || event.turnId;
+        for (const request of this.serverRequests.values()) {
+          if (
+            request.turnId === turnId &&
+            (!event.threadId || request.threadId === event.threadId)
+          )
+            request.controller.abort();
+        }
+      }
+      const handlers = this.notificationHandlers.get(msg.method);
+      if (handlers) {
+        for (const handler of handlers) {
+          try {
+            handler(msg.params);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    }
+  }
+
+  sendRequest(
+    method: string,
+    params?: unknown,
+    timeoutMs = DEFAULT_CODEX_APP_SERVER_REQUEST_TIMEOUT_MS,
+  ): Promise<unknown> {
+    if (this.destroyed) {
+      return Promise.reject(new Error("CodexAppServerProcess destroyed"));
+    }
+    return new Promise((resolve, reject) => {
+      const id = this.nextId++;
+      const pending: PendingRequest = {
+        resolve: (value) => {
+          if (timeoutId !== null) clearTimeout(timeoutId);
+          resolve(value);
+        },
+        reject: (reason) => {
+          if (timeoutId !== null) clearTimeout(timeoutId);
+          reject(reason);
+        },
+      };
+      this.pendingRequests.set(id, pending);
+      const timeoutId =
+        timeoutMs > 0
+          ? setTimeout(() => {
+              const activePending = this.pendingRequests.get(id);
+              if (!activePending) return;
+              this.pendingRequests.delete(id);
+              const error = new Error(
+                `Timed out waiting for codex app-server response to ${method} after ${timeoutMs}ms`,
+              );
+              activePending.reject(error);
+              this.fail(error, true);
+            }, timeoutMs)
+          : null;
+      try {
+        this.writeRawMessage({
+          method,
+          id,
+          params,
+        });
+      } catch (err) {
+        if (timeoutId !== null) clearTimeout(timeoutId);
+        this.pendingRequests.delete(id);
+        reject(err);
+      }
+    });
+  }
+
+  sendNotification(method: string, params?: unknown): void {
+    if (this.destroyed) return;
+    try {
+      this.writeRawMessage({
+        method,
+        params,
+      });
+    } catch {
+      /* ignore if process is gone */
+    }
+  }
+
+  async runTurnExclusive<T>(callback: () => Promise<T>): Promise<T> {
+    const previous = this.turnQueue;
+    let release!: () => void;
+    this.turnQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    await previous;
+    try {
+      if (this.destroyed) {
+        throw new Error("CodexAppServerProcess destroyed");
+      }
+      return await callback();
+    } finally {
+      release();
+    }
+  }
+
+  onNotification(method: string, handler: NotificationHandler): () => void {
+    let handlers = this.notificationHandlers.get(method);
+    if (!handlers) {
+      handlers = new Set();
+      this.notificationHandlers.set(method, handlers);
+    }
+    handlers.add(handler);
+    return () => {
+      this.notificationHandlers.get(method)?.delete(handler);
+    };
+  }
+
+  onActivity(handler: ActivityHandler): () => void {
+    this.activityHandlers.add(handler);
+    return () => {
+      this.activityHandlers.delete(handler);
+    };
+  }
+
+  onClose(handler: () => void): () => void {
+    if (this.didNotifyClose || this.destroyed) {
+      handler();
+      return () => {};
+    }
+    this.closeHandlers.add(handler);
+    return () => {
+      this.closeHandlers.delete(handler);
+    };
+  }
+
+  onRequest(method: string, handler: RequestHandler): () => void {
+    let handlers = this.requestHandlers.get(method);
+    if (!handlers) {
+      handlers = new Set();
+      this.requestHandlers.set(method, handlers);
+    }
+    handlers.add(handler);
+    return () => {
+      this.requestHandlers.get(method)?.delete(handler);
+      for (const [id, request] of this.serverRequests) {
+        if (request.handler !== handler) continue;
+        request.controller.abort();
+        this.serverRequests.delete(id);
+      }
+    };
+  }
+
+  getInjectItemsSupport(): CodexAppServerInjectItemsSupport {
+    return this.injectItemsSupport;
+  }
+
+  setInjectItemsSupport(value: CodexAppServerInjectItemsSupport): void {
+    this.injectItemsSupport = value;
+  }
+
+  isProtocolInitialized(): boolean {
+    return this.protocolInitialized;
+  }
+
+  private async initialize(): Promise<void> {
+    await this.sendRequest("initialize", {
+      clientInfo: {
+        name: "llm-for-zotero",
+        title: "LLM for Zotero",
+        version: "1.0",
+      },
+      capabilities: { experimentalApi: true },
+    });
+    this.sendNotification("initialized");
+    this.protocolInitialized = true;
+  }
+
+  private writeRawMessage(message: Record<string, unknown>): void {
+    const msg = JSON.stringify(message) + "\n";
+    (this.proc as any).stdin.write(msg);
+  }
+
+  destroy(): void {
+    this.fail(new Error("CodexAppServerProcess destroyed"), true);
+  }
+
+  async destroyAndWait(timeoutMs = 2_000): Promise<boolean> {
+    const rawProcess = this.proc as any;
+    this.destroy();
+    const waitBounded = async (task: Promise<unknown>): Promise<boolean> => {
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          task.then(
+            () => true,
+            () => true,
+          ),
+          new Promise<boolean>((resolve) => {
+            timeoutId = setTimeout(
+              () => resolve(false),
+              Math.max(0, timeoutMs),
+            );
+          }),
+        ]);
+      } finally {
+        if (timeoutId !== undefined) clearTimeout(timeoutId);
+      }
+    };
+    const processExited =
+      typeof rawProcess?.wait === "function"
+        ? await waitBounded(Promise.resolve(rawProcess.wait()))
+        : true;
+    const readLoops = [this.readLoopPromise, this.stderrLoopPromise].filter(
+      (task): task is Promise<void> => Boolean(task),
+    );
+    if (readLoops.length) {
+      const loopsDrained = await waitBounded(Promise.allSettled(readLoops));
+      return processExited && loopsDrained;
+    }
+    return processExited;
+  }
+
+  private fail(error: Error, killProcess: boolean): void {
+    if (!this.destroyed) {
+      this.destroyed = true;
+      for (const [, pending] of this.pendingRequests) {
+        pending.reject(error);
+      }
+      this.pendingRequests.clear();
+      for (const request of this.serverRequests.values())
+        request.controller.abort();
+      this.serverRequests.clear();
+    }
+    if (killProcess) {
+      try {
+        (this.proc as any).kill();
+      } catch {
+        /* ignore */
+      }
+    }
+    if (this.didNotifyClose) return;
+    this.didNotifyClose = true;
+    for (const handler of this.closeHandlers) {
+      try {
+        handler();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.closeHandlers.clear();
+  }
+}
+
+export function isCodexAppServerInjectItemsUnsupportedError(
+  error: unknown,
+): boolean {
+  const message = error instanceof Error ? error.message : String(error || "");
+  const normalized = message.toLowerCase();
+  if (!normalized.includes("thread/inject_items")) return false;
+  return (
+    normalized.includes("unknown variant") ||
+    normalized.includes("expected one of") ||
+    normalized.includes("method not found") ||
+    normalized.includes("unknown method") ||
+    normalized.includes("no handler registered") ||
+    normalized.includes("-32601")
+  );
+}
+
+export function isCodexAppServerThreadStartInstructionsUnsupportedError(
+  error: unknown,
+): boolean {
+  const message = error instanceof Error ? error.message : String(error || "");
+  const normalized = message.toLowerCase();
+  if (
+    !normalized.includes("developerinstructions") &&
+    !normalized.includes("developer instructions") &&
+    !normalized.includes("baseinstructions") &&
+    !normalized.includes("base instructions")
+  ) {
+    return false;
+  }
+  return (
+    normalized.includes("unknown field") ||
+    normalized.includes("unknown variant") ||
+    normalized.includes("expected one of") ||
+    normalized.includes("invalid request") ||
+    normalized.includes("invalid params") ||
+    normalized.includes("serde")
+  );
+}
+
+export async function resolveCodexAppServerTurnInputWithFallback(params: {
+  proc: CodexAppServerProcess;
+  threadId: string;
+  historyItemsToInject: CodexAppServerHistoryItem[];
+  turnInput: CodexAppServerUserInput[];
+  legacyInputFactory: () => Promise<CodexAppServerUserInput[]>;
+  logContext: string;
+}): Promise<CodexAppServerUserInput[]> {
+  const support = params.proc.getInjectItemsSupport();
+  if (!params.historyItemsToInject.length) {
+    return params.turnInput;
+  }
+  if (support === "unsupported") {
+    return params.legacyInputFactory();
+  }
+
+  try {
+    await params.proc.sendRequest("thread/inject_items", {
+      threadId: params.threadId,
+      items: params.historyItemsToInject,
+    });
+    params.proc.setInjectItemsSupport("supported");
+    return params.turnInput;
+  } catch (error) {
+    if (!isCodexAppServerInjectItemsUnsupportedError(error)) {
+      throw error;
+    }
+    params.proc.setInjectItemsSupport("unsupported");
+    appLogger.debug(
+      "Codex app-server: thread/inject_items unsupported; using legacy flattened input",
+      { context: params.logContext },
+    );
+    return params.legacyInputFactory();
+  }
+}
+
+function extractCodexAppServerId(
+  result: unknown,
+  nestedKey: "thread" | "turn",
+): string {
+  if (!result || typeof result !== "object") return "";
+  const typed = result as {
+    id?: unknown;
+    thread?: { id?: unknown };
+    turn?: { id?: unknown };
+  };
+  if (typeof typed.id === "string" && typed.id.trim()) {
+    return typed.id.trim();
+  }
+  const nested = typed[nestedKey];
+  if (nested && typeof nested.id === "string" && nested.id.trim()) {
+    return nested.id.trim();
+  }
+  return "";
+}
+
+export function extractCodexAppServerThreadId(result: unknown): string {
+  return extractCodexAppServerId(result, "thread");
+}
+
+export function extractCodexAppServerTurnId(result: unknown): string {
+  return extractCodexAppServerId(result, "turn");
+}
+
+function normalizeCodexAppServerReasoningLevel(
+  reasoning: ReasoningConfig,
+  modelName?: string,
+): "low" | "medium" | "high" | "xhigh" | null {
+  const resolvedLevel =
+    reasoning.level === "default"
+      ? getReasoningDefaultLevelForModel(reasoning.provider, modelName) ||
+        reasoning.level
+      : reasoning.level;
+  if (resolvedLevel === "minimal") return "low";
+  if (resolvedLevel === "low") return "low";
+  if (resolvedLevel === "medium") return "medium";
+  if (resolvedLevel === "high") return "high";
+  if (resolvedLevel === "xhigh") return "xhigh";
+  return null;
+}
+
+export function resolveCodexAppServerReasoningParams(
+  reasoning: ReasoningConfig | undefined,
+  modelName?: string,
+): { effort?: string; summary?: "detailed" } {
+  if (!reasoning) return {};
+  const effort =
+    reasoning.effort?.trim() ||
+    normalizeCodexAppServerReasoningLevel(reasoning, modelName);
+  return {
+    // OpenAI-backed app-server sessions usually expose readable reasoning only
+    // through summary events, so request the richer summary mode explicitly.
+    summary: "detailed",
+    ...(effort ? { effort } : {}),
+  };
+}
+
+function normalizeCodexAppServerText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return value.map((entry) => normalizeCodexAppServerText(entry)).join("");
+  }
+  if (!value || typeof value !== "object") return "";
+  const row = value as {
+    text?: unknown;
+    content?: unknown;
+    summary?: unknown;
+    reasoning?: unknown;
+    message?: unknown;
+  };
+  return (
+    normalizeCodexAppServerText(row.text) ||
+    normalizeCodexAppServerText(row.content) ||
+    normalizeCodexAppServerText(row.summary) ||
+    normalizeCodexAppServerText(row.reasoning) ||
+    normalizeCodexAppServerText(row.message) ||
+    ""
+  );
+}
+
+function normalizeCodexAppServerFieldText(
+  value: unknown,
+  maxLength = 240,
+): string | undefined {
+  const text = normalizeCodexAppServerText(value).replace(/\s+/g, " ").trim();
+  return text ? text.slice(0, maxLength) : undefined;
+}
+
+function redactCodexAppServerUserMessageTransportContext(
+  value: string | undefined,
+): string | undefined {
+  const text = normalizeCodexAppServerText(value);
+  if (!text) return undefined;
+  if (!/^Zotero context for this turn:/i.test(text.trimStart())) return text;
+  const marker = text.match(/\n\nUser request:\n/i);
+  if (!marker || marker.index === undefined) return "User request";
+  const requestText = text.slice(marker.index + marker[0].length).trim();
+  return requestText || "User request";
+}
+
+function normalizeCodexAppServerRawString(
+  value: unknown,
+  maxLength = 4000,
+): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
+  return text ? text.slice(0, maxLength) : undefined;
+}
+
+function normalizeCodexAppServerNumber(value: unknown): number | undefined {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : undefined;
+}
+
+function readCodexAppServerObjectName(value: unknown): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return normalizeCodexAppServerFieldText(value);
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    normalizeCodexAppServerFieldText(record.name) ||
+    normalizeCodexAppServerFieldText(record.toolName) ||
+    normalizeCodexAppServerFieldText(record.title) ||
+    normalizeCodexAppServerFieldText(record.id)
+  );
+}
+
+function copyCodexAppServerRawMetadata(
+  source: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const keys = [
+    "id",
+    "type",
+    "role",
+    "status",
+    "name",
+    "tool",
+    "toolName",
+    "tool_name",
+    "title",
+    "server",
+    "serverName",
+    "server_name",
+    "mcpServerName",
+    "arguments",
+    "args",
+    "input",
+    "error",
+    "query",
+    "action",
+    "command",
+    "cwd",
+    "processId",
+    "source",
+    "commandActions",
+    "aggregatedOutput",
+    "exitCode",
+    "durationMs",
+    "changes",
+    "result",
+    "savedPath",
+    "saved_path",
+    "revisedPrompt",
+    "revised_prompt",
+    "path",
+    "success",
+    "namespace",
+    "prompt",
+    "model",
+    "reasoningEffort",
+    "receiverThreadIds",
+    "senderThreadId",
+    "agentsStates",
+    "contentItems",
+  ];
+  const raw: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
+    raw[key] = source[key];
+  }
+  return Object.keys(raw).length ? raw : undefined;
+}
+
+function extractCodexAppServerItem(
+  rawParams: unknown,
+): CodexAppServerItemEvent | null {
+  if (!rawParams || typeof rawParams !== "object") return null;
+  const source =
+    rawParams &&
+    typeof (rawParams as { item?: unknown }).item === "object" &&
+    (rawParams as { item?: unknown }).item
+      ? (rawParams as { item: unknown }).item
+      : rawParams;
+  if (!source || typeof source !== "object") return null;
+  const sourceRecord = source as Record<string, unknown>;
+  const item = source as {
+    id?: unknown;
+    type?: unknown;
+    role?: unknown;
+    status?: unknown;
+    summary?: unknown;
+    content?: unknown;
+    text?: unknown;
+    reasoning?: unknown;
+    error?: unknown;
+    name?: unknown;
+    tool?: unknown;
+    toolName?: unknown;
+    tool_name?: unknown;
+    title?: unknown;
+    server?: unknown;
+    serverName?: unknown;
+    server_name?: unknown;
+    mcpServerName?: unknown;
+    arguments?: unknown;
+    args?: unknown;
+    input?: unknown;
+    query?: unknown;
+    action?: unknown;
+    command?: unknown;
+    cwd?: unknown;
+    path?: unknown;
+    result?: unknown;
+    savedPath?: unknown;
+    saved_path?: unknown;
+    revisedPrompt?: unknown;
+    revised_prompt?: unknown;
+    exitCode?: unknown;
+    exit_code?: unknown;
+    durationMs?: unknown;
+    duration_ms?: unknown;
+    changes?: unknown;
+    success?: unknown;
+    namespace?: unknown;
+    model?: unknown;
+    receiverThreadIds?: unknown;
+    receiver_thread_ids?: unknown;
+  };
+  const status = typeof item.status === "string" ? item.status.trim() : "";
+  const type =
+    typeof item.type === "string" && item.type.trim()
+      ? item.type.trim().toLowerCase()
+      : undefined;
+  const role =
+    typeof item.role === "string" && item.role.trim()
+      ? item.role.trim().toLowerCase()
+      : undefined;
+  const rawSummary = normalizeCodexAppServerText(item.summary) || undefined;
+  const rawDetails =
+    normalizeCodexAppServerText(item.content) ||
+    normalizeCodexAppServerText(item.reasoning) ||
+    normalizeCodexAppServerText(item.text) ||
+    undefined;
+  const isUserMessageItem =
+    role === "user" ||
+    (type || "").replace(/[-_\s]+/g, "").toLowerCase() === "usermessage";
+  const summary = isUserMessageItem
+    ? redactCodexAppServerUserMessageTransportContext(rawSummary)
+    : rawSummary;
+  const details = isUserMessageItem
+    ? redactCodexAppServerUserMessageTransportContext(rawDetails)
+    : rawDetails;
+  return {
+    id:
+      typeof item.id === "string" && item.id.trim()
+        ? item.id.trim()
+        : undefined,
+    type,
+    role,
+    status: status || undefined,
+    summary,
+    details,
+    error:
+      normalizeCodexAppServerFieldText(item.error, 500) ||
+      normalizeCodexAppServerFieldText(
+        item.error && typeof item.error === "object"
+          ? (item.error as Record<string, unknown>).message
+          : undefined,
+        500,
+      ),
+    name: normalizeCodexAppServerFieldText(item.name),
+    toolName:
+      readCodexAppServerObjectName(item.toolName) ||
+      readCodexAppServerObjectName(item.tool_name) ||
+      readCodexAppServerObjectName(item.tool),
+    title: normalizeCodexAppServerFieldText(item.title),
+    serverName:
+      readCodexAppServerObjectName(item.serverName) ||
+      readCodexAppServerObjectName(item.server_name) ||
+      readCodexAppServerObjectName(item.mcpServerName) ||
+      readCodexAppServerObjectName(item.server),
+    arguments: item.arguments ?? item.args ?? item.input,
+    query: normalizeCodexAppServerFieldText(item.query, 1000),
+    action: item.action,
+    command: normalizeCodexAppServerRawString(item.command, 8000),
+    cwd: normalizeCodexAppServerRawString(item.cwd, 4000),
+    path: normalizeCodexAppServerRawString(item.path, 4000),
+    result: item.result,
+    savedPath:
+      normalizeCodexAppServerRawString(item.savedPath, 4000) ||
+      normalizeCodexAppServerRawString(item.saved_path, 4000),
+    revisedPrompt:
+      normalizeCodexAppServerRawString(item.revisedPrompt, 8000) ||
+      normalizeCodexAppServerRawString(item.revised_prompt, 8000),
+    exitCode: normalizeCodexAppServerNumber(item.exitCode ?? item.exit_code),
+    durationMs: normalizeCodexAppServerNumber(
+      item.durationMs ?? item.duration_ms,
+    ),
+    changes: item.changes,
+    success: typeof item.success === "boolean" ? item.success : undefined,
+    namespace: normalizeCodexAppServerFieldText(item.namespace, 240),
+    model: normalizeCodexAppServerFieldText(item.model, 240),
+    receiverThreadIds: item.receiverThreadIds ?? item.receiver_thread_ids,
+    raw: copyCodexAppServerRawMetadata(sourceRecord),
+  };
+}
+
+function extractCodexAppServerMessageItemId(rawParams: unknown): string {
+  if (!rawParams || typeof rawParams !== "object") return "";
+  const source =
+    rawParams &&
+    typeof (rawParams as { item?: unknown }).item === "object" &&
+    (rawParams as { item?: unknown }).item
+      ? (rawParams as { item: unknown }).item
+      : rawParams;
+  if (!source || typeof source !== "object") return "";
+  const typed = source as {
+    itemId?: unknown;
+    messageId?: unknown;
+    outputItemId?: unknown;
+    id?: unknown;
+    message?: { id?: unknown };
+  };
+  for (const value of [
+    typed.itemId,
+    typed.messageId,
+    typed.outputItemId,
+    typed.id,
+    typed.message?.id,
+  ]) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function isCodexAppServerAgentMessageItem(item: {
+  type?: string;
+  role?: string;
+}): boolean {
+  const normalized = (item.type || "").replace(/[-_\s]+/g, "").toLowerCase();
+  const role = (item.role || "").replace(/[-_\s]+/g, "").toLowerCase();
+  return (
+    normalized === "agentmessage" ||
+    normalized === "assistantmessage" ||
+    (normalized === "message" && (role === "assistant" || role === "agent"))
+  );
+}
+
+function extractCodexAppServerNotificationTurnId(rawParams: unknown): string {
+  if (!rawParams || typeof rawParams !== "object") return "";
+  const typed = rawParams as {
+    turnId?: unknown;
+    turn?: { id?: unknown };
+  };
+  if (typeof typed.turnId === "string" && typed.turnId.trim()) {
+    return typed.turnId.trim();
+  }
+  if (typeof typed.turn?.id === "string" && typed.turn.id.trim()) {
+    return typed.turn.id.trim();
+  }
+  return "";
+}
+
+export type CodexNativePlanDelta = {
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  delta: string;
+};
+export type CodexNativePlanProposal = {
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  text: string;
+};
+
+export function waitForCodexAppServerTurnCompletion(params: {
+  proc: CodexAppServerProcess;
+  turnId?: string;
+  /** Starts generation only after event listeners are installed. */
+  startTurn?: () => Promise<string>;
+  threadId?: string;
+  onTextDelta?: (delta: string) => void | Promise<void>;
+  onReasoning?: (event: ReasoningEvent) => void | Promise<void>;
+  onUsage?: (usage: UsageStats) => void | Promise<void>;
+  onAgentMessageDelta?: (
+    event: CodexAppServerAgentMessageDeltaEvent,
+  ) => void | Promise<void>;
+  onItemStarted?: (event: CodexAppServerItemEvent) => void | Promise<void>;
+  onItemCompleted?: (event: CodexAppServerItemEvent) => void | Promise<void>;
+  onPlanDelta?: (event: CodexNativePlanDelta) => void | Promise<void>;
+  onPlanCompleted?: (event: CodexNativePlanProposal) => void | Promise<void>;
+  onPlanUpdated?: (event: {
+    explanation?: string;
+    steps: Array<{ content: string; status?: string }>;
+  }) => void | Promise<void>;
+  onTurnCompleted?: (event: {
+    turnId: string;
+    status?: string;
+  }) => void | Promise<void>;
+  signal?: AbortSignal;
+  interruptOnAbort?: boolean;
+  cacheKey?: string;
+  processOptions?: CodexAppServerProcessOptions;
+  timeoutMs?: number;
+}): Promise<string> {
+  const {
+    proc,
+    onTextDelta,
+    onReasoning,
+    onUsage,
+    onAgentMessageDelta,
+    onItemStarted,
+    onItemCompleted,
+    onPlanUpdated,
+    onTurnCompleted,
+    signal,
+    cacheKey,
+  } = params;
+  const timeoutMs =
+    params.timeoutMs ?? DEFAULT_CODEX_APP_SERVER_TURN_TIMEOUT_MS;
+  if (signal?.aborted) {
+    return Promise.reject(createAbortError());
+  }
+  return new Promise((resolve, reject) => {
+    let turnId = params.turnId || "";
+    let proposalText: string | undefined;
+    let callbacks = Promise.resolve();
+    let callbackError: unknown;
+    let unsubscribeClose = () => {};
+    const completedProposals = new Set<string>();
+    const enqueue = (callback: () => void | Promise<void>) => {
+      callbacks = callbacks.then(callback).catch((error) => {
+        callbackError ||= error;
+      });
+    };
+    const buffered: Array<() => void> = [];
+    const subscribe = (method: string, callback: (value: unknown) => void) =>
+      proc.onNotification(method, (value) => {
+        const deliver = () => {
+          if (settled || !value || typeof value !== "object") return;
+          const record = value as Record<string, any>;
+          const eventThread = record.threadId || record.thread?.id;
+          if (params.threadId && eventThread && eventThread !== params.threadId)
+            return;
+          const eventTurn = extractCodexAppServerNotificationTurnId(value);
+          if (eventTurn && eventTurn !== turnId) return;
+          callback(value);
+        };
+        if (!turnId) buffered.push(deliver);
+        else deliver();
+      });
+    let accumulated = "";
+    let settled = false;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    let lastEmittedUsageTotals: UsageStats | null = null;
+    let lastMessageItemId = "";
+    const messageTextByItemId = new Map<string, string>();
+    const getResolvedMessageText = () => {
+      if (proposalText !== undefined) return proposalText;
+      if (lastMessageItemId) {
+        const text = messageTextByItemId.get(lastMessageItemId);
+        if (typeof text === "string") return text;
+      }
+      return accumulated;
+    };
+    const reasoningState = new Map<
+      string,
+      { sawSummaryDelta: boolean; sawDetailsDelta: boolean }
+    >();
+    const getReasoningState = (itemId: string) => {
+      let state = reasoningState.get(itemId);
+      if (!state) {
+        state = { sawSummaryDelta: false, sawDetailsDelta: false };
+        reasoningState.set(itemId, state);
+      }
+      return state;
+    };
+    const emitReasoning = (event: ReasoningEvent) => {
+      const summary =
+        typeof event.summary === "string" && event.summary.length > 0
+          ? event.summary
+          : undefined;
+      const details =
+        typeof event.details === "string" && event.details.length > 0
+          ? event.details
+          : undefined;
+      const stepId =
+        typeof event.stepId === "string" && event.stepId.trim()
+          ? event.stepId.trim()
+          : undefined;
+      const stepLabel =
+        typeof event.stepLabel === "string" && event.stepLabel.trim()
+          ? event.stepLabel.trim()
+          : undefined;
+      if (!summary && !details) return;
+      Promise.resolve(
+        onReasoning?.({
+          summary,
+          details,
+          ...(stepId ? { stepId } : {}),
+          ...(stepLabel ? { stepLabel } : {}),
+        }),
+      ).catch(() => {
+        // Ignore downstream consumer errors so the transport can finish cleanly.
+      });
+    };
+    const emitUsage = (usage: UsageStats) => {
+      const nextUsage: UsageStats = {
+        promptTokens: Math.max(0, usage.promptTokens || 0),
+        completionTokens: Math.max(0, usage.completionTokens || 0),
+        totalTokens: Math.max(0, usage.totalTokens || 0),
+        ...(usage.cacheReadTokens
+          ? { cacheReadTokens: usage.cacheReadTokens }
+          : {}),
+        ...(usage.cacheWriteTokens
+          ? { cacheWriteTokens: usage.cacheWriteTokens }
+          : {}),
+        ...(usage.cacheMissTokens
+          ? { cacheMissTokens: usage.cacheMissTokens }
+          : {}),
+        ...(usage.cacheHitRatio ? { cacheHitRatio: usage.cacheHitRatio } : {}),
+        ...(usage.cacheProvider ? { cacheProvider: usage.cacheProvider } : {}),
+      };
+      if (lastEmittedUsageTotals) {
+        const deltaPrompt = Math.max(
+          0,
+          nextUsage.promptTokens - lastEmittedUsageTotals.promptTokens,
+        );
+        const deltaCompletion = Math.max(
+          0,
+          nextUsage.completionTokens - lastEmittedUsageTotals.completionTokens,
+        );
+        const deltaTotal = Math.max(
+          0,
+          nextUsage.totalTokens - lastEmittedUsageTotals.totalTokens,
+        );
+        const deltaCacheRead = Math.max(
+          0,
+          (nextUsage.cacheReadTokens || 0) -
+            (lastEmittedUsageTotals.cacheReadTokens || 0),
+        );
+        const deltaCacheWrite = Math.max(
+          0,
+          (nextUsage.cacheWriteTokens || 0) -
+            (lastEmittedUsageTotals.cacheWriteTokens || 0),
+        );
+        const deltaCacheMiss = Math.max(
+          0,
+          (nextUsage.cacheMissTokens || 0) -
+            (lastEmittedUsageTotals.cacheMissTokens || 0),
+        );
+        lastEmittedUsageTotals = nextUsage;
+        if (deltaTotal <= 0) return;
+        Promise.resolve(
+          onUsage?.({
+            promptTokens: deltaPrompt,
+            completionTokens: deltaCompletion,
+            totalTokens: deltaTotal,
+            ...(deltaCacheRead ? { cacheReadTokens: deltaCacheRead } : {}),
+            ...(deltaCacheWrite ? { cacheWriteTokens: deltaCacheWrite } : {}),
+            ...(deltaCacheMiss ? { cacheMissTokens: deltaCacheMiss } : {}),
+            ...(nextUsage.cacheHitRatio
+              ? { cacheHitRatio: nextUsage.cacheHitRatio }
+              : {}),
+            ...(nextUsage.cacheProvider
+              ? { cacheProvider: nextUsage.cacheProvider }
+              : {}),
+          }),
+        ).catch(() => {
+          // Ignore downstream consumer errors so the transport can finish cleanly.
+        });
+        return;
+      }
+      lastEmittedUsageTotals = nextUsage;
+      if (nextUsage.totalTokens <= 0) return;
+      Promise.resolve(onUsage?.(nextUsage)).catch(() => {
+        // Ignore downstream consumer errors so the transport can finish cleanly.
+      });
+    };
+    const scheduleTimeout = () => {
+      if (timeoutMs <= 0 || settled) return;
+      if (timeoutId !== null) {
+        clearTimeout(timeoutId);
+      }
+      timeoutId = setTimeout(() => {
+        if (proc.hasPendingUserInput(params.threadId, turnId)) {
+          scheduleTimeout();
+          return;
+        }
+        if (cacheKey) {
+          destroyCachedCodexAppServerProcess(
+            cacheKey,
+            proc,
+            params.processOptions,
+          );
+        }
+        settle(() =>
+          reject(
+            new Error(
+              `Timed out waiting for codex app-server turn completion after ${timeoutMs}ms`,
+            ),
+          ),
+        );
+      }, timeoutMs);
+    };
+    const abortHandler = () => {
+      if (params.interruptOnAbort && params.threadId) {
+        void proc
+          .sendRequest(
+            "turn/interrupt",
+            { threadId: params.threadId, turnId },
+            5000,
+          )
+          .catch((error) => {
+            appLogger.warn(
+              "Codex app-server: turn/interrupt failed; destroying process",
+              new Error(
+                redactAllRememberedLocalDocumentPathsFromTerminalText(
+                  error instanceof Error ? error.message : String(error),
+                ),
+              ),
+            );
+            if (cacheKey) {
+              destroyCachedCodexAppServerProcess(
+                cacheKey,
+                proc,
+                params.processOptions,
+              );
+            }
+          });
+      } else if (cacheKey) {
+        destroyCachedCodexAppServerProcess(
+          cacheKey,
+          proc,
+          params.processOptions,
+        );
+      }
+      settle(() => reject(createAbortError()));
+    };
+
+    function settle(fn: () => void) {
+      if (settled) return;
+      settled = true;
+      unsubActivity();
+      unsubDelta();
+      unsubReasoningSummary();
+      unsubReasoningDetails();
+      unsubUsage();
+      unsubItemStarted();
+      unsubItemCompleted();
+      unsubPlanUpdated();
+      unsubPlanDelta();
+      unsubCompleted();
+      unsubscribeClose();
+      if (timeoutId !== null) {
+        clearTimeout(timeoutId);
+      }
+      signal?.removeEventListener("abort", abortHandler);
+      fn();
+    }
+
+    const unsubActivity = proc.onActivity(() => {
+      scheduleTimeout();
+    });
+    scheduleTimeout();
+
+    const unsubDelta = subscribe(
+      "item/agentMessage/delta",
+      (rawParams: unknown) => {
+        const eventTurnId = extractCodexAppServerNotificationTurnId(rawParams);
+        if (eventTurnId && eventTurnId !== turnId) return;
+        const notification = rawParams as { delta?: unknown; text?: unknown };
+        const delta = normalizeCodexAppServerText(
+          notification.delta ?? notification.text,
+        );
+        if (!delta) return;
+        const itemId = extractCodexAppServerMessageItemId(rawParams);
+        accumulated += delta;
+        if (itemId) {
+          lastMessageItemId = itemId;
+          messageTextByItemId.set(
+            itemId,
+            `${messageTextByItemId.get(itemId) || ""}${delta}`,
+          );
+          if (onAgentMessageDelta) {
+            Promise.resolve(onAgentMessageDelta({ itemId, delta })).catch(
+              () => {
+                // Ignore downstream consumer errors so the transport can finish cleanly.
+              },
+            );
+            return;
+          }
+        } else {
+          lastMessageItemId = "";
+        }
+        try {
+          onTextDelta?.(delta);
+        } catch {
+          // Ignore downstream consumer errors so the transport can finish cleanly.
+        }
+      },
+    );
+
+    const unsubPlanDelta = subscribe("item/plan/delta", (value) => {
+      const event = value as Record<string, unknown>;
+      if (typeof event.itemId !== "string" || typeof event.delta !== "string")
+        return;
+      enqueue(() =>
+        params.onPlanDelta?.({
+          threadId: String(event.threadId || params.threadId || ""),
+          turnId,
+          itemId: event.itemId as string,
+          delta: event.delta as string,
+        }),
+      );
+    });
+
+    const unsubPlanUpdated = subscribe(
+      "turn/plan/updated",
+      (rawParams: unknown) => {
+        const eventTurnId = extractCodexAppServerNotificationTurnId(rawParams);
+        if (eventTurnId && eventTurnId !== turnId) return;
+        if (!rawParams || typeof rawParams !== "object") return;
+        const record = rawParams as Record<string, unknown>;
+        const rawSteps = Array.isArray(record.plan)
+          ? record.plan
+          : Array.isArray(record.steps)
+            ? record.steps
+            : [];
+        const steps = rawSteps
+          .map((value) => {
+            if (!value || typeof value !== "object") return null;
+            const step = value as Record<string, unknown>;
+            const content = normalizeCodexAppServerFieldText(
+              step.step ?? step.content ?? step.text,
+              4000,
+            );
+            if (!content) return null;
+            return {
+              content,
+              ...(normalizeCodexAppServerFieldText(step.status, 80)
+                ? {
+                    status: normalizeCodexAppServerFieldText(step.status, 80),
+                  }
+                : {}),
+            };
+          })
+          .filter((value): value is { content: string; status?: string } =>
+            Boolean(value),
+          );
+        if (!steps.length) return;
+        Promise.resolve(
+          onPlanUpdated?.({
+            explanation: normalizeCodexAppServerFieldText(
+              record.explanation,
+              8000,
+            ),
+            steps,
+          }),
+        ).catch(() => {});
+      },
+    );
+
+    const unsubReasoningSummary = subscribe(
+      "item/reasoning/summaryTextDelta",
+      (rawParams: unknown) => {
+        const eventTurnId = extractCodexAppServerNotificationTurnId(rawParams);
+        if (eventTurnId && eventTurnId !== turnId) return;
+        const notification = rawParams as {
+          itemId?: unknown;
+          delta?: unknown;
+          text?: unknown;
+        };
+        const summary = normalizeCodexAppServerText(
+          notification.delta ?? notification.text,
+        );
+        if (!summary) return;
+        const itemId =
+          typeof notification.itemId === "string" && notification.itemId.trim()
+            ? notification.itemId.trim()
+            : undefined;
+        if (itemId) {
+          getReasoningState(itemId).sawSummaryDelta = true;
+        }
+        emitReasoning({ summary, stepId: itemId });
+      },
+    );
+
+    const unsubReasoningDetails = subscribe(
+      "item/reasoning/textDelta",
+      (rawParams: unknown) => {
+        const eventTurnId = extractCodexAppServerNotificationTurnId(rawParams);
+        if (eventTurnId && eventTurnId !== turnId) return;
+        const notification = rawParams as {
+          itemId?: unknown;
+          delta?: unknown;
+          text?: unknown;
+        };
+        const details = normalizeCodexAppServerText(
+          notification.delta ?? notification.text,
+        );
+        if (!details) return;
+        const itemId =
+          typeof notification.itemId === "string" && notification.itemId.trim()
+            ? notification.itemId.trim()
+            : undefined;
+        if (itemId) {
+          getReasoningState(itemId).sawDetailsDelta = true;
+        }
+        emitReasoning({ details, stepId: itemId });
+      },
+    );
+
+    const unsubUsage = subscribe(
+      "thread/tokenUsage/updated",
+      (rawParams: unknown) => {
+        const eventTurnId = extractCodexAppServerNotificationTurnId(rawParams);
+        if (eventTurnId && eventTurnId !== turnId) return;
+        const notification = rawParams as {
+          turnId?: unknown;
+          tokenUsage?: {
+            last?: {
+              totalTokens?: unknown;
+              inputTokens?: unknown;
+              outputTokens?: unknown;
+              cachedTokens?: unknown;
+              cacheReadTokens?: unknown;
+              cacheWriteTokens?: unknown;
+              cacheMissTokens?: unknown;
+            };
+            total?: {
+              totalTokens?: unknown;
+              inputTokens?: unknown;
+              outputTokens?: unknown;
+              cachedTokens?: unknown;
+              cacheReadTokens?: unknown;
+              cacheWriteTokens?: unknown;
+              cacheMissTokens?: unknown;
+            };
+          };
+        };
+        const usage =
+          notification.tokenUsage?.total || notification.tokenUsage?.last;
+        if (!usage) return;
+        const totalTokens =
+          typeof usage.totalTokens === "number" ? usage.totalTokens : 0;
+        const promptTokens =
+          typeof usage.inputTokens === "number" ? usage.inputTokens : 0;
+        const completionTokens =
+          typeof usage.outputTokens === "number" ? usage.outputTokens : 0;
+        if (totalTokens <= 0) return;
+        emitUsage({
+          promptTokens,
+          completionTokens,
+          totalTokens,
+          ...extractContextCacheUsage({
+            inputTokens: promptTokens,
+            prompt_tokens_details:
+              typeof usage.cachedTokens === "number"
+                ? { cached_tokens: usage.cachedTokens }
+                : undefined,
+            cacheReadTokens:
+              typeof usage.cacheReadTokens === "number"
+                ? usage.cacheReadTokens
+                : undefined,
+            cacheWriteTokens:
+              typeof usage.cacheWriteTokens === "number"
+                ? usage.cacheWriteTokens
+                : undefined,
+            cacheMissTokens:
+              typeof usage.cacheMissTokens === "number"
+                ? usage.cacheMissTokens
+                : undefined,
+          }),
+        });
+      },
+    );
+
+    const unsubItemStarted = subscribe("item/started", (rawParams: unknown) => {
+      const eventTurnId = extractCodexAppServerNotificationTurnId(rawParams);
+      if (eventTurnId && eventTurnId !== turnId) return;
+      const item = extractCodexAppServerItem(rawParams);
+      if (!item) return;
+      Promise.resolve(onItemStarted?.(item)).catch(() => {
+        // Ignore downstream consumer errors so the transport can finish cleanly.
+      });
+    });
+
+    const unsubItemCompleted = subscribe(
+      "item/completed",
+      (rawParams: unknown) => {
+        const eventTurnId = extractCodexAppServerNotificationTurnId(rawParams);
+        if (eventTurnId && eventTurnId !== turnId) return;
+        const item = extractCodexAppServerItem(rawParams);
+        if (!item) return;
+        enqueue(() => onItemCompleted?.(item));
+        if (
+          item.type === "plan" &&
+          item.id &&
+          !completedProposals.has(item.id)
+        ) {
+          completedProposals.add(item.id);
+          proposalText = item.details || "";
+          const proposal = {
+            threadId: String(
+              (rawParams as Record<string, unknown>).threadId ||
+                params.threadId ||
+                "",
+            ),
+            turnId,
+            itemId: item.id,
+            text: proposalText,
+          };
+          enqueue(() => params.onPlanCompleted?.(proposal));
+          return;
+        }
+        if (isCodexAppServerAgentMessageItem(item)) {
+          const text = item.details || item.summary || "";
+          if (text && item.id) {
+            lastMessageItemId = item.id;
+            messageTextByItemId.set(item.id, text);
+          }
+          return;
+        }
+        if (item.type !== "reasoning") return;
+        const state = item.id ? getReasoningState(item.id) : undefined;
+        if (item.summary && !state?.sawSummaryDelta) {
+          emitReasoning({ summary: item.summary, stepId: item.id });
+        }
+        if (item.details && !state?.sawDetailsDelta) {
+          emitReasoning({ details: item.details, stepId: item.id });
+        }
+      },
+    );
+
+    const unsubCompleted = subscribe("turn/completed", (rawParams: unknown) => {
+      const notification = rawParams as {
+        turn?: { id?: string; status?: string };
+        turnId?: string;
+        status?: string;
+      };
+      const completedTurnId =
+        typeof notification.turn?.id === "string"
+          ? notification.turn.id
+          : typeof notification.turnId === "string"
+            ? notification.turnId
+            : "";
+      if (completedTurnId !== turnId) return;
+      const status =
+        typeof notification.turn?.status === "string"
+          ? notification.turn.status
+          : typeof notification.status === "string"
+            ? notification.status
+            : undefined;
+      enqueue(() => onTurnCompleted?.({ turnId: completedTurnId, status }));
+      void callbacks.then(() => {
+        if (callbackError) {
+          settle(() => reject(callbackError));
+        } else if (status === "completed") {
+          settle(() => resolve(getResolvedMessageText()));
+        } else if (status === "interrupted") {
+          settle(() => reject(createAbortError()));
+        } else {
+          settle(() =>
+            reject(new Error(`Turn ended with status: ${status ?? "unknown"}`)),
+          );
+        }
+      });
+    });
+
+    signal?.addEventListener("abort", abortHandler, { once: true });
+    unsubscribeClose = proc.onClose(() => {
+      void callbacks.then(() =>
+        settle(() => reject(new Error("Codex app-server connection closed"))),
+      );
+    });
+    if (!settled && params.startTurn) {
+      void params
+        .startTurn()
+        .then((id) => {
+          if (settled) return;
+          if (!id) throw new Error("Codex app-server did not return a turn ID");
+          turnId = id;
+          for (const deliver of buffered.splice(0)) deliver();
+        })
+        .catch((error) => settle(() => reject(error)));
+    }
+  });
+}
+
+export function waitForCodexAppServerThreadCompacted(params: {
+  proc: CodexAppServerProcess;
+  threadId: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}): Promise<void> {
+  const timeoutMs =
+    params.timeoutMs ?? DEFAULT_CODEX_APP_SERVER_TURN_TIMEOUT_MS;
+  const threadId = params.threadId.trim();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      unsubCompacted();
+      if (timeoutId !== null) {
+        clearTimeout(timeoutId);
+      }
+      params.signal?.removeEventListener("abort", abortHandler);
+      fn();
+    };
+
+    const abortHandler = () => {
+      settle(() => reject(createAbortError()));
+    };
+
+    const unsubCompacted = params.proc.onNotification(
+      "thread/compacted",
+      (rawParams: unknown) => {
+        const compactedThreadId =
+          extractCodexAppServerNotificationThreadId(rawParams);
+        if (compactedThreadId !== threadId) return;
+        settle(() => resolve());
+      },
+    );
+
+    if (timeoutMs > 0) {
+      timeoutId = setTimeout(() => {
+        settle(() =>
+          reject(
+            new Error(
+              `Timed out waiting for codex app-server thread compaction after ${timeoutMs}ms`,
+            ),
+          ),
+        );
+      }, timeoutMs);
+    }
+
+    if (params.signal?.aborted) {
+      abortHandler();
+      return;
+    }
+    params.signal?.addEventListener("abort", abortHandler, { once: true });
+  });
+}
+
+function getNonEmptyEnvValue(
+  env: Record<string, string | undefined>,
+  key: string,
+): string | undefined {
+  const value = env[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function getRuntimeEnvValue(key: string): string | undefined {
+  const processValue = (globalThis as any).process?.env?.[key];
+  if (typeof processValue === "string" && processValue.trim()) {
+    return processValue.trim();
+  }
+  try {
+    const servicesValue = (globalThis as any).Services?.env?.get?.(key);
+    if (typeof servicesValue === "string" && servicesValue.trim()) {
+      return servicesValue.trim();
+    }
+  } catch {
+    /* ignore */
+  }
+  return undefined;
+}
+
+function getCodexRuntimeEnv(): Record<string, string | undefined> {
+  const processEnv = (globalThis as any).process?.env ?? {};
+  const env: Record<string, string | undefined> = { ...processEnv };
+  for (const key of CODEX_ENV_KEYS) {
+    env[key] = getRuntimeEnvValue(key);
+  }
+  return env;
+}
+
+export function mergeCodexNoProxyValues(
+  ...values: Array<string | undefined>
+): string {
+  const entries: string[] = [];
+  const seen = new Set<string>();
+  for (const value of [...values, CODEX_LOOPBACK_NO_PROXY_ENTRIES.join(",")]) {
+    for (const rawEntry of String(value || "").split(",")) {
+      const entry = rawEntry.trim();
+      if (!entry) continue;
+      const key = entry.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      entries.push(entry);
+    }
+  }
+  return entries.join(",");
+}
+
+function buildCodexLaunchEnvironment(
+  invocationEnvironment?: Record<string, string>,
+): Record<string, string> {
+  const runtimeEnv = getCodexRuntimeEnv();
+  const noProxy = mergeCodexNoProxyValues(
+    runtimeEnv.NO_PROXY,
+    runtimeEnv.no_proxy,
+  );
+  return {
+    ...invocationEnvironment,
+    NO_PROXY: noProxy,
+    no_proxy: noProxy,
+  };
+}
+
+function joinRuntimePath(
+  separator: "/" | "\\",
+  base: string,
+  ...parts: string[]
+): string {
+  let current = base.replace(/[\\/]+$/, "");
+  for (const part of parts) {
+    const normalized = part.replace(/^[\\/]+|[\\/]+$/g, "");
+    if (!normalized) continue;
+    current = current ? `${current}${separator}${normalized}` : normalized;
+  }
+  return current;
+}
+
+function resolveListedChildPath(
+  separator: "/" | "\\",
+  parent: string,
+  child: string,
+): string {
+  const trimmed = child.trim();
+  if (!trimmed) return trimmed;
+  if (
+    trimmed.startsWith(parent) ||
+    trimmed.includes(separator) ||
+    (separator === "\\" && /^[a-z]:\\/i.test(trimmed))
+  ) {
+    return trimmed;
+  }
+  return joinRuntimePath(separator, parent, trimmed);
+}
+
+function uniquePaths(paths: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const path of paths) {
+    const normalized = path.trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  const IOUtils = (globalThis as any).IOUtils;
+  if (IOUtils?.exists) {
+    try {
+      return Boolean(await IOUtils.exists(path));
+    } catch {
+      return false;
+    }
+  }
+  const OSFile = (globalThis as any).OS?.File;
+  if (OSFile?.exists) {
+    try {
+      return Boolean(await OSFile.exists(path));
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+async function readSubprocessStdout(proc: any): Promise<string> {
+  return readSubprocessString(proc.stdout);
+}
+
+async function readSubprocessString(stream: any): Promise<string> {
+  let out = "";
+  try {
+    while (true) {
+      const chunk = await stream?.readString?.();
+      if (!chunk) break;
+      out += chunk;
+    }
+  } catch {
+    /* ignore */
+  }
+  return out;
+}
+
+async function waitForSubprocessExitCode(
+  proc: any,
+): Promise<number | undefined> {
+  try {
+    const result = await proc.wait?.();
+    const exitCode = result?.exitCode;
+    return typeof exitCode === "number" ? exitCode : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function listChildren(path: string): Promise<string[]> {
+  const IOUtils = (globalThis as any).IOUtils;
+  if (!IOUtils?.getChildren) return [];
+  try {
+    const children = await IOUtils.getChildren(path);
+    return Array.isArray(children)
+      ? children.filter((entry): entry is string => typeof entry === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function buildPrefixCodexCandidates(params: {
+  prefix: string;
+  platform: "windows" | "macos" | "linux";
+  separator: "/" | "\\";
+}): string[] {
+  const prefix = params.prefix.trim();
+  if (!prefix) return [];
+  if (params.platform === "windows") {
+    return [
+      joinRuntimePath(params.separator, prefix, "codex.cmd"),
+      joinRuntimePath(params.separator, prefix, "codex.exe"),
+      joinRuntimePath(params.separator, prefix, "bin", "codex.cmd"),
+      joinRuntimePath(params.separator, prefix, "bin", "codex.exe"),
+    ];
+  }
+  return [
+    joinRuntimePath(params.separator, prefix, "bin", "codex"),
+    joinRuntimePath(params.separator, prefix, "codex"),
+  ];
+}
+
+function buildWindowsShellCommand(binary: string): string {
+  return /\s/.test(binary)
+    ? `""${binary}" app-server"`
+    : `${binary} app-server`;
+}
+
+function splitWindowsCommandLine(value: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index] || "";
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+  if (current) tokens.push(current);
+  return tokens;
+}
+
+function isWslAbsolutePath(path: string): boolean {
+  return path.startsWith("/") && !path.startsWith("//");
+}
+
+function isUnsupportedWindowsWslCodexReference(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (trimmed.startsWith("wsl:codex:")) return true;
+  if (isWslAbsolutePath(trimmed)) return true;
+  const command = splitWindowsCommandLine(trimmed)[0] || "";
+  return /(^|[\\/])wsl(?:\.exe)?$/i.test(command);
+}
+
+function createWindowsWslCodexUnsupportedError(): Error {
+  return new Error(
+    "WSL Codex is not supported on Windows for Zotero Codex App Server. Zotero MCP uses Windows-local loopback, so install native Windows Codex, run `codex login` from PowerShell or Command Prompt, and leave the Codex path blank or set it to a native path such as C:\\Users\\<user>\\AppData\\Roaming\\npm\\codex.cmd.",
+  );
+}
+
+function formatLaunchDescription(command: string, args: string[]): string {
+  return [command, ...args].join(" ");
+}
+
+function getPathDirectory(path: string): string {
+  const index = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
+  if (index < 0) return "";
+  return path.slice(0, index) || "/";
+}
+
+function getWindowsDirectory(path: string): string {
+  return getPathDirectory(path);
+}
+
+async function buildWindowsCodexInvocation(
+  binary: string,
+  info: ReturnType<typeof getRuntimePlatformInfo>,
+): Promise<CodexLaunchInvocation> {
+  if (isUnsupportedWindowsWslCodexReference(binary)) {
+    throw createWindowsWslCodexUnsupportedError();
+  }
+
+  const directory = getWindowsDirectory(binary);
+  if (directory && /\.cmd$/i.test(binary)) {
+    const nativeInvocation =
+      await resolveWindowsNpmNativeCodexInvocation(directory);
+    if (nativeInvocation) return nativeInvocation;
+
+    const nodePath = joinRuntimePath("\\", directory, "node.exe");
+    const codexJsPath = getWindowsNpmCodexJsPath(directory);
+    if ((await pathExists(nodePath)) && (await pathExists(codexJsPath))) {
+      return {
+        command: nodePath,
+        args: [codexJsPath, "app-server"],
+      };
+    }
+  }
+
+  if (/\.(exe|com)$/i.test(binary)) {
+    return {
+      command: binary,
+      args: ["app-server"],
+    };
+  }
+
+  // npm shims are usually batch scripts, and bare `codex` needs PATHEXT lookup.
+  return {
+    command: info.shellPath,
+    args: ["/d", "/s", info.shellFlag, buildWindowsShellCommand(binary)],
+  };
+}
+
+async function buildPosixCodexInvocation(
+  binary: string,
+  info: ReturnType<typeof getRuntimePlatformInfo>,
+): Promise<CodexLaunchInvocation> {
+  const env = getCodexRuntimeEnv();
+  const homeDir = getNonEmptyEnvValue(env, "HOME") || "";
+  const prefixCandidates = uniquePaths(
+    [
+      getNonEmptyEnvValue(env, "NPM_CONFIG_PREFIX"),
+      getNonEmptyEnvValue(env, "npm_config_prefix"),
+      getNonEmptyEnvValue(env, "PREFIX"),
+    ]
+      .filter((entry): entry is string => Boolean(entry))
+      .flatMap((prefix) =>
+        buildPrefixCodexCandidates({
+          prefix,
+          platform: info.platform,
+          separator: "/",
+        }),
+      ),
+  );
+  const nvmCandidates = homeDir
+    ? await listNvmCodexCandidates({
+        homeDir,
+        nvmDir: getNonEmptyEnvValue(env, "NVM_DIR"),
+        separator: "/",
+      })
+    : [];
+  const pathEntries = uniquePaths([
+    getPathDirectory(binary),
+    ...prefixCandidates.map(getPathDirectory),
+    homeDir ? joinRuntimePath("/", homeDir, ".cargo", "bin") : "",
+    homeDir ? joinRuntimePath("/", homeDir, ".npm-global", "bin") : "",
+    homeDir ? joinRuntimePath("/", homeDir, ".local", "bin") : "",
+    homeDir ? joinRuntimePath("/", homeDir, ".volta", "bin") : "",
+    homeDir ? joinRuntimePath("/", homeDir, ".asdf", "shims") : "",
+    ...nvmCandidates.map(getPathDirectory),
+    ...(info.platform === "macos" ? ["/opt/homebrew/bin"] : []),
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+  ]);
+  const inheritedPath = getNonEmptyEnvValue(env, "PATH") || "";
+  const path = uniquePaths([...pathEntries, ...inheritedPath.split(":")]).join(
+    ":",
+  );
+  return {
+    command: binary,
+    args: ["app-server"],
+    ...(path ? { environment: { PATH: path } } : {}),
+  };
+}
+
+function getWindowsNpmCodexJsPath(directory: string): string {
+  return joinRuntimePath(
+    "\\",
+    directory,
+    "node_modules",
+    "@openai",
+    "codex",
+    "bin",
+    "codex.js",
+  );
+}
+
+async function resolveWindowsNpmNativeCodexInvocation(
+  directory: string,
+): Promise<{
+  command: string;
+  args: string[];
+  environment?: Record<string, string>;
+} | null> {
+  const codexPackageRoot = joinRuntimePath(
+    "\\",
+    directory,
+    "node_modules",
+    "@openai",
+    "codex",
+  );
+  const targetTriple = "x86_64-pc-windows-msvc";
+  const nativeRoots = [
+    joinRuntimePath(
+      "\\",
+      codexPackageRoot,
+      "node_modules",
+      "@openai",
+      "codex-win32-x64",
+      "vendor",
+      targetTriple,
+    ),
+    joinRuntimePath("\\", codexPackageRoot, "vendor", targetTriple),
+  ];
+
+  for (const nativeRoot of nativeRoots) {
+    const nativeBinary = joinRuntimePath(
+      "\\",
+      nativeRoot,
+      "codex",
+      "codex.exe",
+    );
+    if (!(await pathExists(nativeBinary))) continue;
+
+    const pathDir = joinRuntimePath("\\", nativeRoot, "path");
+    const runtimePath =
+      getRuntimeEnvValue("PATH") || getRuntimeEnvValue("Path") || "";
+    const environment: Record<string, string> = {
+      CODEX_MANAGED_BY_NPM: "1",
+    };
+    if (await pathExists(pathDir)) {
+      environment.PATH = runtimePath ? `${pathDir};${runtimePath}` : pathDir;
+    }
+    return {
+      command: nativeBinary,
+      args: ["app-server"],
+      environment,
+    };
+  }
+
+  return null;
+}
+
+function buildWindowsCodexCandidates(
+  env: Record<string, string | undefined>,
+): string[] {
+  const userProfile = getNonEmptyEnvValue(env, "USERPROFILE");
+  // Fall back to %USERPROFILE%\AppData\... when APPDATA / LOCALAPPDATA are
+  // missing (some sandboxed runtimes drop them) — but only when USERPROFILE
+  // is real, so we never fabricate a fake user name.
+  const appData =
+    getNonEmptyEnvValue(env, "APPDATA") ??
+    (userProfile
+      ? joinRuntimePath("\\", userProfile, "AppData", "Roaming")
+      : undefined);
+  const localAppData =
+    getNonEmptyEnvValue(env, "LOCALAPPDATA") ??
+    (userProfile
+      ? joinRuntimePath("\\", userProfile, "AppData", "Local")
+      : undefined);
+  const nvmHome = getNonEmptyEnvValue(env, "NVM_HOME");
+  const nvmSymlink = getNonEmptyEnvValue(env, "NVM_SYMLINK");
+  const candidates: string[] = [];
+
+  if (userProfile) {
+    candidates.push(
+      joinRuntimePath("\\", userProfile, ".cargo", "bin", "codex.exe"),
+    );
+  }
+  if (appData) {
+    candidates.push(
+      joinRuntimePath("\\", appData, "npm", "codex.cmd"),
+      joinRuntimePath("\\", appData, "npm", "codex.exe"),
+    );
+  }
+  if (localAppData) {
+    candidates.push(
+      joinRuntimePath("\\", localAppData, "Volta", "bin", "codex.cmd"),
+      joinRuntimePath("\\", localAppData, "Volta", "bin", "codex.exe"),
+      joinRuntimePath(
+        "\\",
+        localAppData,
+        "Microsoft",
+        "WinGet",
+        "Links",
+        "codex.exe",
+      ),
+    );
+  }
+  for (const nvmRoot of [nvmSymlink, nvmHome]) {
+    if (!nvmRoot) continue;
+    candidates.push(
+      joinRuntimePath("\\", nvmRoot, "codex.cmd"),
+      joinRuntimePath("\\", nvmRoot, "codex.exe"),
+      joinRuntimePath("\\", nvmRoot, "codex"),
+    );
+  }
+  candidates.push("C:\\Program Files\\codex\\codex.exe");
+  candidates.push("C:\\Program Files\\WinGet\\Links\\codex.exe");
+  return uniquePaths(candidates);
+}
+
+export async function listNvmCodexCandidates(params: {
+  homeDir: string;
+  nvmDir?: string;
+  separator: "/";
+}): Promise<string[]> {
+  const root =
+    params.nvmDir?.trim() || joinRuntimePath("/", params.homeDir, ".nvm");
+  const versionsDir = joinRuntimePath(
+    params.separator,
+    root,
+    "versions",
+    "node",
+  );
+  const versionDirs = await listChildren(versionsDir);
+  return versionDirs
+    .map((entry) =>
+      resolveListedChildPath(params.separator, versionsDir, entry),
+    )
+    .sort((a, b) => b.localeCompare(a))
+    .map((versionDir) =>
+      joinRuntimePath(params.separator, versionDir, "bin", "codex"),
+    );
+}
+
+export function resolveCodexAppServerBinaryPath(
+  value?: string | null,
+): string | undefined {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  if (!trimmed) return undefined;
+  if (/^https?:\/\//i.test(trimmed)) return undefined;
+  const quoted = trimmed.match(/^(['"])(.*)\1$/);
+  if (quoted?.[2]?.trim()) return quoted[2].trim();
+  return trimmed;
+}
+
+export function selectCodexLookupResult(
+  output: string,
+  platform: "windows" | "macos" | "linux",
+): string {
+  const candidates = output
+    .trim()
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const first = candidates[0] || "";
+  if (platform !== "windows" || !first) return first;
+  // Preserve PATH precedence: only swap to a same-directory `.cmd` sibling
+  // (e.g. when `where codex` lists `…\codex` and `…\codex.cmd` for the same
+  // npm shim, the `.cmd` is the one we know how to dispatch through the
+  // npm-native fast path). Never jump to a `.cmd` from a different install
+  // that sits later on PATH.
+  if (/\.cmd$/i.test(first)) return first;
+  const firstDir = getWindowsDirectory(first).toLowerCase();
+  const sameDirCmd = candidates.find(
+    (candidate) =>
+      /\.cmd$/i.test(candidate) &&
+      getWindowsDirectory(candidate).toLowerCase() === firstDir,
+  );
+  return sameDirCmd || first;
+}
+
+function createCodexBinaryNotFoundError(
+  platform: "windows" | "macos" | "linux",
+) {
+  const windowsHint =
+    platform === "windows"
+      ? " On Windows, only native Windows Codex is supported because Zotero MCP uses Windows-local loopback; install Codex from PowerShell or Command Prompt and run `codex login` there. WSL Codex is not supported."
+      : "";
+  return new Error(
+    "codex binary not found. Install Codex CLI (https://github.com/openai/codex) and ensure it is on your PATH, " +
+      "set the Codex CLI Path in the plugin's Agent settings to the absolute path of the codex executable, " +
+      "or set the CODEX_PATH environment variable." +
+      windowsHint,
+  );
+}
+
+function isWindowsPathLike(path: string): boolean {
+  return (
+    /^[a-z]:[\\/]/i.test(path) || path.includes("\\") || path.includes("/")
+  );
+}
+
+async function resolveWindowsCodexShimPath(path: string): Promise<string> {
+  if (!isWindowsPathLike(path)) return path;
+
+  const ps1Match = path.match(/\.ps1$/i);
+  const extensionlessMatch = path.match(/[\\/]codex$/i);
+  if (!ps1Match && !extensionlessMatch) return path;
+
+  const base = ps1Match ? path.slice(0, -4) : path;
+  for (const candidate of [`${base}.cmd`, `${base}.exe`]) {
+    if (await pathExists(candidate)) return candidate;
+  }
+  return path;
+}
+
+async function resolveCodexBinaryFromShellPathLookup(
+  info: ReturnType<typeof getRuntimePlatformInfo>,
+  Subprocess: any,
+): Promise<string | undefined> {
+  if (!Subprocess?.call) return undefined;
+  try {
+    const lookupCmd =
+      info.platform === "windows" ? "where codex" : "which codex";
+    const proc = await Subprocess.call({
+      command: info.shellPath,
+      arguments: [info.shellFlag, lookupCmd],
+    });
+    const out = await readSubprocessStdout(proc);
+    const exitCode = await waitForSubprocessExitCode(proc);
+    const found =
+      exitCode === undefined || exitCode === 0
+        ? selectCodexLookupResult(out, info.platform)
+        : "";
+    return found || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function resolveWindowsNativeCodexBinary(params: {
+  env: Record<string, string | undefined>;
+  Subprocess: any;
+}): Promise<string | undefined> {
+  const info = getRuntimePlatformInfo();
+  const lookupResult = await resolveCodexBinaryFromShellPathLookup(
+    info,
+    params.Subprocess,
+  );
+  if (lookupResult) {
+    return await resolveWindowsCodexShimPath(lookupResult);
+  }
+
+  const prefixCandidates = uniquePaths(
+    [
+      getNonEmptyEnvValue(params.env, "NPM_CONFIG_PREFIX"),
+      getNonEmptyEnvValue(params.env, "npm_config_prefix"),
+      getNonEmptyEnvValue(params.env, "PREFIX"),
+    ]
+      .filter((entry): entry is string => Boolean(entry))
+      .flatMap((prefix) =>
+        buildPrefixCodexCandidates({
+          prefix,
+          platform: "windows",
+          separator: "\\",
+        }),
+      ),
+  );
+  for (const candidate of [
+    ...prefixCandidates,
+    ...buildWindowsCodexCandidates(params.env),
+  ]) {
+    if (await pathExists(candidate)) return candidate;
+  }
+
+  return undefined;
+}
+
+export async function resolveCodexBinary(
+  explicitPath?: string,
+): Promise<string> {
+  const normalizedExplicitPath = resolveCodexAppServerBinaryPath(explicitPath);
+  const info = getRuntimePlatformInfo();
+  const env = getCodexRuntimeEnv();
+
+  let Subprocess: any;
+  try {
+    Subprocess = await CodexAppServerProcess.loadSubprocessModule();
+  } catch {
+    Subprocess = null;
+  }
+
+  if (normalizedExplicitPath) {
+    if (info.platform === "windows") {
+      if (isUnsupportedWindowsWslCodexReference(normalizedExplicitPath)) {
+        throw createWindowsWslCodexUnsupportedError();
+      }
+      return await resolveWindowsCodexShimPath(normalizedExplicitPath);
+    }
+    return normalizedExplicitPath;
+  }
+
+  // 1. CODEX_PATH env var
+  const codexPath = resolveCodexAppServerBinaryPath(env.CODEX_PATH);
+  if (codexPath) {
+    if (info.platform === "windows") {
+      if (isUnsupportedWindowsWslCodexReference(codexPath)) {
+        throw createWindowsWslCodexUnsupportedError();
+      }
+      return await resolveWindowsCodexShimPath(codexPath);
+    }
+    return codexPath;
+  }
+
+  // 2. Locate via `which`/`where` using shell
+  if (info.platform === "windows") {
+    const nativeCodex = await resolveWindowsNativeCodexBinary({
+      env,
+      Subprocess,
+    });
+    if (nativeCodex) return nativeCodex;
+  } else {
+    const found = await resolveCodexBinaryFromShellPathLookup(info, Subprocess);
+    if (found) return found;
+  }
+
+  if (info.platform === "windows") {
+    throw createCodexBinaryNotFoundError(info.platform);
+  }
+
+  // 3. Deterministic common install paths
+  const homeDir =
+    getNonEmptyEnvValue(env, "HOME") ||
+    getNonEmptyEnvValue(env, "USERPROFILE") ||
+    "";
+  const prefixCandidates = uniquePaths(
+    [
+      getNonEmptyEnvValue(env, "NPM_CONFIG_PREFIX"),
+      getNonEmptyEnvValue(env, "npm_config_prefix"),
+      getNonEmptyEnvValue(env, "PREFIX"),
+    ]
+      .filter((entry): entry is string => Boolean(entry))
+      .flatMap((prefix) =>
+        buildPrefixCodexCandidates({
+          prefix,
+          platform: info.platform,
+          separator: info.pathSeparator,
+        }),
+      ),
+  );
+  const commonCandidates = uniquePaths([
+    homeDir
+      ? joinRuntimePath(info.pathSeparator, homeDir, ".cargo", "bin", "codex")
+      : "",
+    homeDir
+      ? joinRuntimePath(
+          info.pathSeparator,
+          homeDir,
+          ".npm-global",
+          "bin",
+          "codex",
+        )
+      : "",
+    homeDir
+      ? joinRuntimePath(info.pathSeparator, homeDir, ".local", "bin", "codex")
+      : "",
+    homeDir
+      ? joinRuntimePath(info.pathSeparator, homeDir, ".volta", "bin", "codex")
+      : "",
+    homeDir
+      ? joinRuntimePath(info.pathSeparator, homeDir, ".asdf", "shims", "codex")
+      : "",
+    ...(info.platform === "macos" ? ["/opt/homebrew/bin/codex"] : []),
+    "/usr/local/bin/codex",
+    "/usr/bin/codex",
+  ]);
+
+  const nvmCandidates = !homeDir
+    ? []
+    : await listNvmCodexCandidates({
+        homeDir,
+        nvmDir: getNonEmptyEnvValue(env, "NVM_DIR"),
+        separator: "/",
+      });
+
+  for (const candidate of [
+    ...prefixCandidates,
+    ...commonCandidates,
+    ...nvmCandidates,
+  ]) {
+    if (await pathExists(candidate)) return candidate;
+  }
+
+  throw createCodexBinaryNotFoundError(info.platform);
+}
+
+// Per-auth-mode singleton processes
+const processCache = new Map<string, Promise<CodexAppServerProcess>>();
+
+function buildProcessCacheKey(
+  cacheKey: string,
+  options: CodexAppServerProcessOptions = {},
+): string {
+  const codexPath = resolveCodexAppServerBinaryPath(options.codexPath);
+  return codexPath ? `${cacheKey}\u0000${codexPath}` : cacheKey;
+}
+
+export function destroyCachedCodexAppServerProcess(
+  cacheKey: string,
+  proc?: CodexAppServerProcess,
+  options: CodexAppServerProcessOptions = {},
+): void {
+  const effectiveCacheKey = buildProcessCacheKey(cacheKey, options);
+  const existing = processCache.get(effectiveCacheKey);
+  if (!existing) {
+    proc?.destroy();
+    return;
+  }
+
+  processCache.delete(effectiveCacheKey);
+  existing
+    .then((cachedProc) => {
+      if (proc && cachedProc !== proc) return;
+      cachedProc.destroy();
+    })
+    .catch(() => {
+      if (proc) {
+        proc.destroy();
+      }
+    });
+}
+
+export async function getOrCreateCodexAppServerProcess(
+  cacheKey: string,
+  options: CodexAppServerProcessOptions = {},
+): Promise<CodexAppServerProcess> {
+  const effectiveCacheKey = buildProcessCacheKey(cacheKey, options);
+  const existing = processCache.get(effectiveCacheKey);
+  if (existing) {
+    return existing;
+  }
+  const promise = CodexAppServerProcess.spawn(options);
+  promise.then((proc) => {
+    proc.onClose(() => {
+      if (processCache.get(effectiveCacheKey) === promise) {
+        processCache.delete(effectiveCacheKey);
+      }
+    });
+  });
+  processCache.set(effectiveCacheKey, promise);
+  promise.catch(() => processCache.delete(effectiveCacheKey));
+  return promise;
+}

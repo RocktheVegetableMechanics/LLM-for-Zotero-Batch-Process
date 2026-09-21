@@ -1,0 +1,4360 @@
+export let openBatchPaperConversationInStandalone:
+  | ((summary: any, paper: Zotero.Item) => Promise<void>)
+  | undefined;
+import {
+  buildDefaultUpstreamGlobalConversationKey,
+  config,
+  GLOBAL_CONVERSATION_KEY_BASE,
+} from "./constants";
+import { appLogger } from "../../core/logging";
+import { isConversationKeyForKind } from "../../shared/conversationKeySpace";
+import {
+  activeContextPanels,
+  unregisterContextPanel,
+  activeContextPanelRawItems,
+  activeGlobalConversationByLibrary,
+  activePaperConversationByPaper,
+  selectedRuntimeModeCache,
+} from "./state";
+import {
+  resolveConversationSystemForItem,
+  resolveDisplayConversationKind,
+  resolveInitialPanelItemState,
+  resolveRememberedGlobalPanelItem,
+  resolveConversationBaseItem,
+  resolvePaperChatSourceItem,
+  resolveActiveNoteSession,
+  resolvePreferredConversationSystem,
+  resolveNoteFocusSystemSwitch,
+  resolveShortcutMode,
+  createGlobalPortalItem,
+  createPaperPortalItem,
+} from "./portalScope";
+import { isGlobalPortalItem } from "../../services/context/portalItems";
+import { resolveActiveLibraryID } from "../../utils/zoteroLibraryScope";
+import {
+  applyPanelFontScale,
+  buildPaperStateKey,
+  getClaudeCodeModeEnabled,
+  getLastUsedUpstreamGlobalConversationKey,
+  getStandaloneSidebarWidthPref,
+  getLockedGlobalConversationKey,
+  setLastUsedUpstreamConversationMode,
+  setLastUsedUpstreamGlobalConversationKey,
+  setLockedGlobalConversationKey,
+  setStandaloneSidebarWidthPref,
+} from "./prefHelpers";
+import { buildUI } from "./buildUI";
+import {
+  createHistoryActivityIndicator,
+  observeHistoryActivity,
+} from "./historyActivity";
+import {
+  disposeSetupHandlers,
+  setupHandlers,
+  type ContextPreviewRenderMetrics,
+  type SetupHandlersHooks,
+} from "./setupHandlers";
+import {
+  ensureConversationLoaded,
+  getConversationKey,
+  refreshChat,
+  resetSessionTokens,
+} from "./chat";
+import { renderShortcuts } from "./shortcuts";
+import { createElement, HTML_NS } from "../../utils/domHelpers";
+import { t } from "../../utils/i18n";
+import {
+  bindStandalonePanelHost,
+  canLifecycleCommitPanelConversation,
+  capturePanelOperationLease,
+  clearPanelHostBinding,
+  isPanelOperationLeaseCurrent,
+} from "./panelHostOwnership";
+import type { ConversationSystem } from "../../shared/types";
+import type { ChatRuntimeMode } from "./types";
+import {
+  conversationRepository,
+  type ConversationCatalogEntry,
+} from "../../core/conversations/repository";
+import {
+  ATTACHMENT_GC_MIN_AGE_MS,
+  collectAndDeleteUnreferencedBlobs,
+} from "../../utils/attachmentRefStore";
+import {
+  chatHistory,
+  loadedConversationKeys,
+  webChatIsolatedConversationKeys,
+} from "./state";
+import { loadAllConversationHistory } from "./historyLoader";
+import {
+  formatGlobalHistoryTimestamp,
+  groupHistoryEntriesByDay,
+  isOrphanHistoryEntry,
+  maybeSelectPaperHistoryTarget,
+  normalizeConversationTitleSeed,
+  normalizeHistoryPaperItemID,
+  normalizeHistoryTitle,
+  resolvePaperHistoryNavigationDecision,
+  resolveHistoryEntryPaperBaseItem,
+  resolveHistoryEntrySourceState,
+  type ConversationHistoryEntry,
+  type HistoryPaperPaneSelector,
+} from "./setupHandlers/controllers/conversationHistoryController";
+import {
+  createHistorySearchDocument,
+  createHistorySearchDocumentFingerprint,
+  type HistorySearchDocument,
+} from "./setupHandlers/controllers/historySearchController";
+import { createHistorySearchPopupController } from "./setupHandlers/controllers/historySearchPopupController";
+import { primeHistoryNavigationMode } from "./historyNavigationModeSync";
+import { resolveStandalonePaperTabLabel } from "./standaloneTabLabel";
+import { resolveFreshConversationDraft } from "./freshConversationDraft";
+import { collapseDuplicateReusableConversationDrafts } from "./standaloneConversationResolution";
+import {
+  createRuntimeSystemControls,
+  RUNTIME_CONVERSATION_SYSTEMS,
+  resolveRuntimeSystemToggleTarget,
+  syncRuntimeSystemControls,
+} from "./runtimeSystemControls";
+import { buildDefaultClaudeGlobalConversationKey } from "../../claudeCode/constants";
+import {
+  resolveRememberedClaudeConversationKey,
+  invalidateAllClaudeHotRuntimes,
+  refreshClaudeSlashCommands,
+} from "../../claudeCode/runtime";
+import {
+  retainClaudeRuntimeForBody,
+  releaseClaudeRuntimeForBody,
+} from "../../claudeCode/runtimeRetention";
+import {
+  createClaudeProjectSkillTemplate,
+  deleteClaudeProjectSkillFile,
+  getClaudeProjectDir,
+  listClaudeProjectSkillEntries,
+} from "../../claudeCode/projectSkills";
+import { initAgentSubsystem } from "../../agent";
+import {
+  getConversationSystemPref,
+  getStoredConversationSystemPref,
+  getLastUsedClaudeConversationMode,
+  getLastUsedClaudeGlobalConversationKey,
+  setConversationSystemPref,
+  setLastUsedClaudeConversationMode,
+} from "../../claudeCode/prefs";
+import {
+  activeClaudeGlobalConversationByLibrary,
+  activeClaudePaperConversationByPaper,
+  buildClaudeLibraryStateKey,
+  buildClaudePaperStateKey,
+} from "../../claudeCode/state";
+import { showStandaloneConfirmationDialog } from "./standaloneConfirmationDialog";
+import { showConversationRenameDialog } from "./conversationRenameDialog";
+import {
+  canCommitConversationRename,
+  isConversationRenameEligible,
+  type ConversationRenameIdentity,
+} from "./conversationRenameEligibility";
+import {
+  installStandaloneSidebarResizeBehavior,
+  installStandaloneVerticalResizeBehavior,
+  scheduleStandaloneWindowFitForElement,
+  STANDALONE_SIDEBAR_DEFAULT_WIDTH_PX,
+} from "./standaloneWindowSizing";
+import {
+  createClaudeGlobalPortalItem,
+  createClaudePaperPortalItem,
+} from "../../claudeCode/portal";
+import { loadAllClaudeConversationHistory } from "../../claudeCode/historyLoader";
+import { buildDefaultCodexGlobalConversationKey } from "../../codexAppServer/constants";
+import {
+  createCodexGlobalPortalItem,
+  createCodexPaperPortalItem,
+} from "../../codexAppServer/portal";
+import {
+  getLastUsedCodexConversationMode,
+  getLastUsedCodexGlobalConversationKey,
+  isCodexAppServerModeEnabled,
+  setLastUsedCodexConversationMode,
+  setLastUsedCodexGlobalConversationKey,
+  setLastUsedCodexPaperConversationKey,
+} from "../../codexAppServer/prefs";
+import {
+  activeCodexGlobalConversationByLibrary,
+  activeCodexPaperConversationByPaper,
+  buildCodexLibraryStateKey,
+  buildCodexPaperStateKey,
+} from "../../codexAppServer/state";
+import { loadAllCodexConversationHistory } from "../../codexAppServer/historyLoader";
+import { clearActiveConversationForPendingDeletion } from "./conversationDeletionActivation";
+import {
+  createSerializedConversationDeletionEventQueue,
+  resolveConversationDeletionSurfaceAction,
+} from "./conversationDeletionSurfaceSync";
+import {
+  forgetRecentlyDeletedConversation,
+  hasConversationDeletionTombstoneForKey,
+  isConversationInstanceRecentlyDeleted,
+  markConversationInstanceRecentlyDeleted,
+} from "../../core/conversations/recentlyDeletedConversations";
+import {
+  pendingDeletionStore,
+  type PendingConversationDeletionEntry,
+  type PendingDeletionEvent,
+} from "../../core/conversations/pendingDeletionStore";
+import { getConversationWriteGeneration } from "../../shared/conversationWriteFence";
+import { setStatus } from "./textUtils";
+import { getRegisteredConversationScope } from "../../shared/conversationRegistry";
+import {
+  createStandaloneSidebarView,
+  setStandaloneSidebarCollapsedChromeHost,
+  setStandaloneSidebarFlyoutOpen,
+  setStandaloneSidebarState,
+} from "./standaloneSidebarView";
+import { installStandaloneSidebarFlyout } from "./standaloneSidebarFlyout";
+
+type StandaloneSessionState = {
+  pending: boolean;
+  window: Window | null;
+};
+
+const standaloneSessionState: StandaloneSessionState = {
+  pending: false,
+  window: null,
+};
+
+const STANDALONE_MIN_WIDTH_PX = 500;
+const STANDALONE_MIN_HEIGHT_PX = 500;
+const STANDALONE_SIDEBAR_AUTO_COLLAPSE_THRESHOLD_PX =
+  STANDALONE_MIN_WIDTH_PX + STANDALONE_SIDEBAR_DEFAULT_WIDTH_PX;
+const STANDALONE_SIDEBAR_AUTO_EXPAND_THRESHOLD_PX = 600;
+const STANDALONE_WINDOW_FEATURES =
+  "chrome,extrachrome,menubar,resizable,scrollbars,status,centerscreen,dialog=no,dependent=no";
+
+function clampStandaloneWindowSize(win: Window): void {
+  try {
+    const currentWidth = Math.ceil(
+      Number(win.outerWidth || win.innerWidth || 0),
+    );
+    const currentHeight = Math.ceil(
+      Number(win.outerHeight || win.innerHeight || 0),
+    );
+    if (!Number.isFinite(currentWidth) || !Number.isFinite(currentHeight)) {
+      return;
+    }
+    const nextWidth = Math.max(currentWidth, STANDALONE_MIN_WIDTH_PX);
+    const nextHeight = Math.max(currentHeight, STANDALONE_MIN_HEIGHT_PX);
+    if (nextWidth !== currentWidth || nextHeight !== currentHeight) {
+      win.resizeTo(nextWidth, nextHeight);
+    }
+  } catch (err) {
+    appLogger.debug("LLM: standalone minimum size fallback failed", err);
+  }
+}
+
+export function getStandaloneSessionWindow(): Window | null {
+  const candidate =
+    standaloneSessionState.window || addon.data.standaloneWindow || null;
+  if (!candidate || candidate.closed) {
+    standaloneSessionState.window = null;
+    if (addon.data.standaloneWindow === candidate) {
+      addon.data.standaloneWindow = undefined;
+    }
+    return null;
+  }
+  standaloneSessionState.window = candidate;
+  if (addon.data.standaloneWindow !== candidate) {
+    addon.data.standaloneWindow = candidate;
+  }
+  return candidate;
+}
+
+function setStandaloneSessionWindow(win: Window | null): void {
+  standaloneSessionState.window = win && !win.closed ? win : null;
+  addon.data.standaloneWindow = standaloneSessionState.window || undefined;
+}
+
+function setStandalonePending(pending: boolean): void {
+  standaloneSessionState.pending = pending;
+}
+
+/** Returns true when the standalone chat window is open or being opened. */
+export function isStandaloneWindowActive(): boolean {
+  if (standaloneSessionState.pending) return true;
+  return Boolean(getStandaloneSessionWindow());
+}
+
+// Callback registered by initWindow for item-change notifications.
+let standaloneItemChangeHandler: ((item: Zotero.Item | null) => void) | null =
+  null;
+
+/** Called by index.ts onItemChange when the user switches paper tabs. */
+export function notifyStandaloneItemChanged(item: Zotero.Item | null): void {
+  standaloneItemChangeHandler?.(item);
+}
+
+function isStandaloneTrackedBody(body: Element): boolean {
+  const standaloneWin = getStandaloneSessionWindow();
+  if (standaloneWin && body.ownerDocument === standaloneWin.document) {
+    return true;
+  }
+  return (body as HTMLElement).dataset?.standalone === "true";
+}
+
+function renderStandalonePlaceholdersInEmbeddedPanels(
+  excludedBody?: Element | null,
+): void {
+  const seenBodies = new Set<Element>();
+  const mainWindows = Zotero.getMainWindows?.() || [];
+  for (const win of mainWindows) {
+    const panelRoots = win?.document?.querySelectorAll?.("#llm-main") || [];
+    for (const panelRoot of panelRoots) {
+      const body = (panelRoot as Element).parentElement;
+      if (
+        !body ||
+        !body.isConnected ||
+        body === excludedBody ||
+        isStandaloneTrackedBody(body) ||
+        seenBodies.has(body)
+      ) {
+        continue;
+      }
+      renderStandalonePlaceholder(body);
+      seenBodies.add(body);
+    }
+  }
+  for (const [body] of activeContextPanels) {
+    if (
+      !(body as Element).isConnected ||
+      body === excludedBody ||
+      isStandaloneTrackedBody(body as Element) ||
+      seenBodies.has(body as Element)
+    ) {
+      continue;
+    }
+    renderStandalonePlaceholder(body as Element);
+    seenBodies.add(body as Element);
+  }
+}
+
+function restoreEmbeddedPanelsAfterStandaloneClose(
+  excludedBody?: Element | null,
+): void {
+  for (const [body] of activeContextPanels) {
+    if (excludedBody && body === excludedBody) continue;
+    if (!(body as Element).isConnected) {
+      void releaseClaudeRuntimeForBody(body as Element);
+      unregisterContextPanel(body);
+      continue;
+    }
+    const rawItem = activeContextPanelRawItems.get(body as Element) || null;
+    const resolved = resolveInitialPanelItemState(rawItem, {
+      conversationSystem: resolveConversationSystemForItem(rawItem),
+    });
+    const hostLease = capturePanelOperationLease(body as Element);
+    if (
+      !canLifecycleCommitPanelConversation(
+        body as Element,
+        resolved.item,
+        "restore-embedded-panel",
+        hostLease,
+      )
+    ) {
+      continue;
+    }
+    buildUI(body as Element, resolved.item);
+    activeContextPanels.set(body, () => resolved.item);
+    activeContextPanelRawItems.set(body as Element, rawItem);
+    setupHandlers(body as Element, resolved.item || rawItem);
+    void (async () => {
+      try {
+        if (resolved.item) await ensureConversationLoaded(resolved.item);
+        if (!isPanelOperationLeaseCurrent(hostLease)) return;
+        await renderShortcuts(
+          body as Element,
+          resolved.item,
+          resolveShortcutMode(resolved.item),
+        );
+        if (!isPanelOperationLeaseCurrent(hostLease)) return;
+        refreshChat(body as Element, resolved.item);
+      } catch (err) {
+        appLogger.warn("LLM: side panel restore failed", err);
+      }
+    })();
+  }
+}
+
+/**
+ * Replace a side-panel body with a placeholder message while the
+ * standalone window is open.
+ */
+export function renderStandalonePlaceholder(body: Element): void {
+  if (typeof (body as any).replaceChildren === "function") {
+    (body as any).replaceChildren();
+  } else {
+    body.textContent = "";
+  }
+  const doc = body.ownerDocument!;
+  const wrap = createElement(doc, "div", "llm-standalone-placeholder");
+  wrap.style.cssText =
+    "display:flex;flex-direction:column;align-items:center;justify-content:center;" +
+    "height:100%;gap:12px;padding:24px;text-align:center;color:var(--fill-secondary);";
+
+  const msg = createElement(doc, "div", "", {
+    textContent: t("Chat is open in a separate window"),
+  });
+  msg.style.cssText = "font-size:13px;";
+
+  const focusBtn = createElement(doc, "button", "llm-btn llm-btn-primary", {
+    textContent: t("Focus Window"),
+    type: "button",
+  });
+  focusBtn.style.cssText =
+    "display:flex;align-items:center;justify-content:center;" +
+    "padding:6px 16px;border-radius:6px;cursor:pointer;font-size:12px;" +
+    "background:var(--color-accent,#2563eb);color:#fff;border:none;";
+  focusBtn.addEventListener("click", () => {
+    getStandaloneSessionWindow()?.focus();
+  });
+
+  const closeBtn = createElement(doc, "button", "llm-btn", {
+    textContent: t("Close Window & Return Here"),
+    type: "button",
+  });
+  closeBtn.style.cssText =
+    "display:flex;align-items:center;justify-content:center;" +
+    "padding:6px 16px;border-radius:6px;cursor:pointer;font-size:12px;" +
+    "background:none;color:var(--fill-secondary);border:1px solid var(--stroke-secondary,#888);";
+  closeBtn.addEventListener("click", () => {
+    try {
+      const win =
+        getStandaloneSessionWindow() ||
+        (addon.data.standaloneWindow as Window | undefined) ||
+        null;
+      appLogger.debug(
+        "LLM: close standalone clicked, win=",
+        Boolean(win),
+        "closed=",
+        win ? (win as any).closed : "N/A",
+      );
+      if (win && !(win as any).closed) {
+        (win as any).close();
+      }
+    } catch (err) {
+      appLogger.warn("LLM: close standalone failed", err);
+    }
+  });
+
+  wrap.append(msg, focusBtn, closeBtn);
+  body.appendChild(wrap);
+}
+
+type SidebarConv = {
+  conversationID?: string;
+  conversationKey: number;
+  kind?: "global" | "paper";
+  conversationSystem?: ConversationSystem;
+  libraryID?: number;
+  lastActivityAt: number;
+  title?: string;
+  userTurnCount?: number;
+  sessionVersion?: number;
+  paperItemID?: number;
+  providerSessionId?: string;
+  scopedConversationKey?: string;
+  mode?: "open" | "paper";
+};
+
+type StandaloneCreateConversationOptions = {
+  forceFresh?: boolean;
+  excludeConversationKey?: number;
+};
+
+// ---------------------------------------------------------------------------
+// Standalone window
+// ---------------------------------------------------------------------------
+
+/**
+ * Open the LLM chat in a standalone window. If already open, focuses it.
+ */
+export function openStandaloneChat(options?: {
+  initialItem?: Zotero.Item | null;
+  initialConversationSystem?: ConversationSystem | null;
+  initialRuntimeMode?: ChatRuntimeMode | null;
+  sourceBody?: Element | null;
+}): void {
+  const existingWin = getStandaloneSessionWindow();
+  if (existingWin) {
+    existingWin.focus();
+    return;
+  }
+
+  const mainWin = Zotero.getMainWindow();
+  if (!mainWin) return;
+
+  const sourceRawContextItem =
+    options?.sourceBody && options.sourceBody.isConnected
+      ? activeContextPanelRawItems.get(options.sourceBody) || null
+      : null;
+  const sourceItem = sourceRawContextItem || options?.initialItem || null;
+  const explicitConversationSystem = options?.initialConversationSystem
+    ? resolvePreferredConversationSystem({
+        item: null,
+        preferredSystem: options.initialConversationSystem,
+      })
+    : null;
+  const storedConversationSystem = getStoredConversationSystemPref();
+  const preferredConversationSystem =
+    explicitConversationSystem ||
+    storedConversationSystem ||
+    getConversationSystemPref();
+  const initialRuntimeMode =
+    options?.initialRuntimeMode === "agent"
+      ? "agent"
+      : options?.initialRuntimeMode === "chat"
+        ? "chat"
+        : null;
+  const sourceItemSystem = resolveConversationSystemForItem(sourceItem);
+  const sourceItemForResolution =
+    explicitConversationSystem &&
+    sourceItemSystem &&
+    sourceItemSystem !== explicitConversationSystem
+      ? resolveConversationBaseItem(sourceItem)
+      : sourceItem;
+  const sourceConversationSystem: ConversationSystem =
+    explicitConversationSystem ||
+    (sourceItemForResolution
+      ? resolvePreferredConversationSystem({
+          item: sourceItemForResolution,
+          preferredSystem: preferredConversationSystem,
+        })
+      : preferredConversationSystem === "codex" && isCodexAppServerModeEnabled()
+        ? "codex"
+        : preferredConversationSystem === "claude_code" &&
+            getClaudeCodeModeEnabled()
+          ? "claude_code"
+          : "upstream");
+  const resolvedSourceState = resolveInitialPanelItemState(
+    sourceItemForResolution,
+    {
+      conversationSystem: sourceConversationSystem,
+    },
+  );
+  let currentConversationSystem: ConversationSystem =
+    explicitConversationSystem ||
+    resolvePreferredConversationSystem({
+      item: resolvedSourceState.item,
+      preferredSystem: sourceConversationSystem,
+    });
+  const initialBasePaperItem =
+    resolvedSourceState.basePaperItem ||
+    resolvePaperChatSourceItem(sourceItemForResolution || sourceItem) ||
+    null;
+  const initialDisplayConversationKind = resolveDisplayConversationKind(
+    resolvedSourceState.item || sourceItem,
+  );
+  const isClaudeConversationSystem = () =>
+    currentConversationSystem === "claude_code";
+  const isCodexConversationSystem = () => currentConversationSystem === "codex";
+  const isRuntimeConversationSystem = () =>
+    isClaudeConversationSystem() || isCodexConversationSystem();
+  const initialLibraryID =
+    Number(
+      resolvedSourceState.item?.libraryID ||
+        initialBasePaperItem?.libraryID ||
+        sourceItem?.libraryID ||
+        resolveActiveLibraryID() ||
+        1,
+    ) || 1;
+
+  const libraryID = initialLibraryID > 0 ? Math.floor(initialLibraryID) : 1;
+  const initialRememberedRuntimeMode =
+    currentConversationSystem === "claude_code"
+      ? getLastUsedClaudeConversationMode(libraryID)
+      : currentConversationSystem === "codex"
+        ? getLastUsedCodexConversationMode(libraryID)
+        : null;
+  const initialMode: "open" | "paper" =
+    initialDisplayConversationKind === "global"
+      ? "open"
+      : initialDisplayConversationKind === "paper" && initialBasePaperItem
+        ? "paper"
+        : initialRememberedRuntimeMode === "global"
+          ? "open"
+          : initialBasePaperItem
+            ? "paper"
+            : "open";
+  const lockedKey = isRuntimeConversationSystem()
+    ? null
+    : getLockedGlobalConversationKey(libraryID);
+  const sourceClaudeGlobalKey =
+    resolvedSourceState.item &&
+    (resolvedSourceState.item as any).__llmClaudeGlobalPortalItem === true
+      ? Number(resolvedSourceState.item.id || 0)
+      : sourceItem && (sourceItem as any).__llmClaudeGlobalPortalItem === true
+        ? Number(sourceItem.id || 0)
+        : 0;
+  const sourceCodexGlobalKey =
+    resolvedSourceState.item &&
+    (resolvedSourceState.item as any).__llmCodexGlobalPortalItem === true
+      ? Number(resolvedSourceState.item.id || 0)
+      : sourceItem && (sourceItem as any).__llmCodexGlobalPortalItem === true
+        ? Number(sourceItem.id || 0)
+        : 0;
+  const sourceUpstreamGlobalKey = isGlobalPortalItem(resolvedSourceState.item)
+    ? Number(resolvedSourceState.item?.id || 0)
+    : isGlobalPortalItem(sourceItem)
+      ? Number(sourceItem?.id || 0)
+      : 0;
+  const rememberedUpstreamGlobalKey =
+    activeGlobalConversationByLibrary.get(libraryID) ??
+    getLastUsedUpstreamGlobalConversationKey(libraryID);
+  const conversationKey = isClaudeConversationSystem()
+    ? sourceClaudeGlobalKey > 0
+      ? sourceClaudeGlobalKey
+      : resolveRememberedClaudeConversationKey({
+          libraryID,
+          kind: "global",
+        }) || buildDefaultClaudeGlobalConversationKey(libraryID)
+    : isCodexConversationSystem()
+      ? sourceCodexGlobalKey > 0
+        ? sourceCodexGlobalKey
+        : activeCodexGlobalConversationByLibrary.get(
+            buildCodexLibraryStateKey(libraryID),
+          ) ||
+          getLastUsedCodexGlobalConversationKey(libraryID) ||
+          buildDefaultCodexGlobalConversationKey(libraryID)
+      : sourceUpstreamGlobalKey > 0
+        ? sourceUpstreamGlobalKey
+        : (lockedKey ??
+          (rememberedUpstreamGlobalKey === GLOBAL_CONVERSATION_KEY_BASE
+            ? buildDefaultUpstreamGlobalConversationKey(libraryID)
+            : rememberedUpstreamGlobalKey) ??
+          buildDefaultUpstreamGlobalConversationKey(libraryID));
+  const globalPortalItem = isClaudeConversationSystem()
+    ? createClaudeGlobalPortalItem(libraryID, conversationKey)
+    : isCodexConversationSystem()
+      ? createCodexGlobalPortalItem(libraryID, conversationKey)
+      : createGlobalPortalItem(libraryID, conversationKey);
+  const initialPaperItem =
+    initialMode === "paper"
+      ? resolvedSourceState.item || initialBasePaperItem
+      : null;
+  const initialNoteSession = resolveActiveNoteSession(resolvedSourceState.item);
+  const initialMountedItem = initialNoteSession
+    ? resolvedSourceState.item
+    : initialPaperItem || globalPortalItem;
+
+  // Set flag BEFORE openDialog — keeps isStandaloneWindowActive() true
+  // throughout the entire openDialog + load cycle so any onRender calls
+  // in the sidepanel will show the placeholder.
+  setStandalonePending(true);
+
+  const newWin = mainWin.openDialog(
+    `chrome://${config.addonRef}/content/standaloneChat.xhtml`,
+    "llmforzotero-standalone-chat",
+    STANDALONE_WINDOW_FEATURES,
+  ) as Window | null;
+  if (!newWin) {
+    setStandalonePending(false);
+    return;
+  }
+
+  if (options?.sourceBody && options.sourceBody.isConnected) {
+    renderStandalonePlaceholder(options.sourceBody);
+  }
+  renderStandalonePlaceholdersInEmbeddedPanels(options?.sourceBody || null);
+
+  setStandaloneSessionWindow(newWin);
+  // Keep standalonePending = true until initWindow runs — see below
+  let cancelled = false;
+
+  // Mutable state for the standalone window
+  let standaloneMode: "open" | "paper" = initialMode;
+  let activeConversationKey = getConversationKey(initialMountedItem);
+  let activeItem: Zotero.Item = initialMountedItem;
+  let currentPaperItem: Zotero.Item | null = initialPaperItem;
+  let currentBasePaperItem: Zotero.Item | null = initialBasePaperItem;
+  let currentRawContextItem: Zotero.Item | null =
+    sourceItemForResolution || sourceItem || initialMountedItem;
+  let isInWebChatMode = false;
+  let currentChatHooks: SetupHandlersHooks | null = null;
+  let standaloneSidebarRenderQueued = false;
+  let standaloneMountGeneration = 0;
+  let explicitNewChatInFlight = false;
+  let initialRuntimeModeSeeded = false;
+  let standaloneAttachmentGcTimer: number | null = null;
+  let unsubscribeStandalonePendingDeletions: (() => void) | null = null;
+  let disposeHistoryActivity: (() => void) | null = null;
+  let themeObserver: {
+    observe(target: Node, options: MutationObserverInit): void;
+    disconnect(): void;
+  } | null = null;
+  let darkMQ: MediaQueryList | null = null;
+  let onSchemeChange: (() => void) | null = null;
+  let cleanupStandalonePrefObserver: (() => void) | null = null;
+  let cleanupStandaloneVerticalResize: (() => void) | null = null;
+  let cleanupStandaloneSidebarResize: (() => void) | null = null;
+  let cleanupStandaloneSidebarFlyout: (() => void) | null = null;
+  let enforceStandaloneMinimumSize: (() => void) | null = null;
+
+  const initWindow = () => {
+    // Now the window is loaded — safe to clear the pending flag.
+    // isStandaloneWindowActive() will still return true because
+    // addon.data.standaloneWindow is set and not closed.
+    setStandalonePending(false);
+    // Reset cancelled — the about:blank → XHTML transition in XUL may
+    // fire an early unload that sets cancelled=true before load fires.
+    cancelled = false;
+    // Re-store the window reference for the same reason.
+    setStandaloneSessionWindow(newWin);
+    // Register the real unload handler now that the document is loaded.
+    newWin.addEventListener("unload", cleanupWindow, { once: true });
+    appLogger.debug("LLM: standalone initWindow start");
+
+    const scheduleStandaloneAttachmentGc = (delayMs = 5_000) => {
+      const clearTimer = () => {
+        if (standaloneAttachmentGcTimer === null) return;
+        newWin.clearTimeout(standaloneAttachmentGcTimer);
+        standaloneAttachmentGcTimer = null;
+      };
+      clearTimer();
+      standaloneAttachmentGcTimer = newWin.setTimeout(() => {
+        standaloneAttachmentGcTimer = null;
+        void collectAndDeleteUnreferencedBlobs(ATTACHMENT_GC_MIN_AGE_MS).catch(
+          (err) => {
+            appLogger.warn("LLM: standalone attachment GC failed", err);
+          },
+        );
+      }, delayMs);
+    };
+
+    try {
+      const doc = newWin.document;
+      doc.documentElement?.setAttribute(
+        "minwidth",
+        `${STANDALONE_MIN_WIDTH_PX}`,
+      );
+      doc.documentElement?.setAttribute(
+        "minheight",
+        `${STANDALONE_MIN_HEIGHT_PX}`,
+      );
+      if (doc.documentElement) {
+        doc.documentElement.style.minWidth = `${STANDALONE_MIN_WIDTH_PX}px`;
+        doc.documentElement.style.minHeight = `${STANDALONE_MIN_HEIGHT_PX}px`;
+      }
+      enforceStandaloneMinimumSize = () => clampStandaloneWindowSize(newWin);
+      newWin.addEventListener("resize", enforceStandaloneMinimumSize);
+      newWin.setTimeout(enforceStandaloneMinimumSize, 0);
+
+      // Inject Zotero CSS variables that the standalone window doesn't inherit.
+      const zoteroVars = [
+        "--fill-primary",
+        "--fill-secondary",
+        "--fill-tertiary",
+        "--fill-quaternary",
+        "--fill-quinary",
+        "--stroke-primary",
+        "--stroke-secondary",
+        "--material-background",
+        "--material-sidepane",
+        "--material-toolbar",
+        "--color-accent",
+        "--accent-blue",
+      ];
+      const mainDocEl = mainWin.document.documentElement;
+      let styleEl: HTMLStyleElement | null = null;
+
+      function parseCssRgbChannel(channel: string): number | null {
+        const trimmed = channel.trim();
+        if (!trimmed) return null;
+        const value = Number.parseFloat(trimmed);
+        if (!Number.isFinite(value)) return null;
+        if (trimmed.endsWith("%")) {
+          return Math.max(0, Math.min(255, (value / 100) * 255));
+        }
+        return Math.max(0, Math.min(255, value));
+      }
+
+      function parseCssRgbColor(
+        value: string,
+      ): [number, number, number] | null {
+        const trimmed = value.trim();
+        if (!trimmed) return null;
+        const hex = trimmed.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i)?.[1];
+        if (hex) {
+          const full =
+            hex.length === 3
+              ? hex
+                  .split("")
+                  .map((part) => `${part}${part}`)
+                  .join("")
+              : hex;
+          return [
+            Number.parseInt(full.slice(0, 2), 16),
+            Number.parseInt(full.slice(2, 4), 16),
+            Number.parseInt(full.slice(4, 6), 16),
+          ];
+        }
+        const rgb = trimmed.match(/^rgba?\(([^)]+)\)$/i)?.[1];
+        if (!rgb) return null;
+        const parts = rgb
+          .replace(/\s*\/\s*[^, ]+$/, "")
+          .split(/[,\s]+/)
+          .filter(Boolean);
+        if (parts.length < 3) return null;
+        const channels = parts.slice(0, 3).map(parseCssRgbChannel);
+        if (channels.some((channel) => channel === null)) return null;
+        return channels as [number, number, number];
+      }
+
+      function getCssRgbLuminance(color: [number, number, number]): number {
+        const [r, g, b] = color.map((channel) => {
+          const value = channel / 255;
+          return value <= 0.03928
+            ? value / 12.92
+            : ((value + 0.055) / 1.055) ** 2.4;
+        });
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      }
+
+      function isLightStandaloneTheme(
+        style: CSSStyleDeclaration | null,
+      ): boolean {
+        const background =
+          style?.getPropertyValue("--material-background").trim() ||
+          style?.getPropertyValue("--material-sidepane").trim() ||
+          "";
+        const color = parseCssRgbColor(background);
+        if (color) return getCssRgbLuminance(color) > 0.5;
+        return !mainWin.matchMedia?.("(prefers-color-scheme: dark)")?.matches;
+      }
+
+      const syncZoteroVarsToStandalone = () => {
+        if (cancelled || newWin.closed) return;
+        const freshStyle = mainDocEl
+          ? mainWin.getComputedStyle(mainDocEl)
+          : null;
+        const rootEl = doc.getElementById(
+          "llmforzotero-standalone-chat-root",
+        ) as HTMLElement | null;
+        if (rootEl) {
+          rootEl.dataset.standaloneTheme = isLightStandaloneTheme(freshStyle)
+            ? "light"
+            : "dark";
+        }
+        const decls = zoteroVars
+          .map((v) => {
+            const val = freshStyle?.getPropertyValue(v).trim();
+            return val ? `${v}: ${val};` : "";
+          })
+          .filter(Boolean)
+          .join("\n  ");
+        if (!decls) return;
+        if (!styleEl) {
+          styleEl = doc.createElementNS(HTML_NS, "style") as HTMLStyleElement;
+          doc.documentElement?.prepend(styleEl);
+        }
+        styleEl.textContent = `:root {\n  ${decls}\n}`;
+      };
+
+      // Initial injection
+      syncZoteroVarsToStandalone();
+
+      // Re-sync when Zotero's theme changes (attribute changes on root element).
+      // Access MutationObserver from the main window — it's not a global in the
+      // standalone window's Gecko execution context.
+      const MO = (mainWin as any).MutationObserver as
+        | typeof MutationObserver
+        | undefined;
+      if (MO && mainDocEl) {
+        themeObserver = new MO(() => syncZoteroVarsToStandalone());
+        themeObserver.observe(mainDocEl, {
+          attributes: true,
+          attributeFilter: ["style", "class"],
+        });
+      }
+
+      // Re-sync on OS-level dark/light switch
+      const mq = mainWin.matchMedia?.("(prefers-color-scheme: dark)") ?? null;
+      darkMQ = mq;
+      onSchemeChange = () => {
+        newWin.setTimeout(() => syncZoteroVarsToStandalone(), 100);
+      };
+      if (mq) mq.addEventListener("change", onSchemeChange);
+
+      // Inject CSS
+      const mainCSS = doc.createElementNS(HTML_NS, "link") as HTMLLinkElement;
+      mainCSS.rel = "stylesheet";
+      mainCSS.type = "text/css";
+      mainCSS.href = `chrome://${config.addonRef}/content/zoteroPane.css`;
+      doc.documentElement?.appendChild(mainCSS);
+
+      const katexCSS = doc.createElementNS(HTML_NS, "link") as HTMLLinkElement;
+      katexCSS.rel = "stylesheet";
+      katexCSS.type = "text/css";
+      katexCSS.href = `chrome://${config.addonRef}/content/vendor/katex/katex.min.css`;
+      doc.documentElement?.appendChild(katexCSS);
+
+      const rerenderStandaloneShellAfterStylesReady = () => {
+        if (cancelled || newWin.closed) return;
+        const mountedItem = activeItem;
+        if (!mountedItem) return;
+        const llmMain = contentArea.querySelector(
+          "#llm-main",
+        ) as HTMLElement | null;
+        applyPanelFontScale(llmMain);
+        applyPanelFontScale(root);
+        const shortcutMode = standaloneMode === "open" ? "library" : "paper";
+        void renderShortcuts(contentArea, mountedItem, shortcutMode);
+        refreshChat(contentArea, mountedItem);
+      };
+      mainCSS.addEventListener(
+        "load",
+        rerenderStandaloneShellAfterStylesReady,
+        {
+          once: true,
+        },
+      );
+
+      // Mount into the root div
+      const root = doc.getElementById(
+        "llmforzotero-standalone-chat-root",
+      ) as HTMLElement | null;
+      if (!root) return;
+
+      root.dataset.standalone = "true";
+
+      // -----------------------------------------------------------------------
+      // Build the shell layout:
+      //   topbar (full width)
+      //   lowerArea: unified expandable sidebar | content
+      // -----------------------------------------------------------------------
+
+      // Switch root from row to column
+      root.style.flexDirection = "column";
+
+      // -- Tab group (centered at top of content area) --
+      const paperTab = doc.createElementNS(
+        HTML_NS,
+        "button",
+      ) as HTMLButtonElement;
+      paperTab.className = "llm-standalone-tab";
+      paperTab.type = "button";
+      paperTab.textContent = t(
+        resolveStandalonePaperTabLabel({
+          isNoteSession: Boolean(resolveActiveNoteSession(activeItem)),
+        }),
+      );
+      paperTab.dataset.tab = "paper";
+
+      const openTab = doc.createElementNS(
+        HTML_NS,
+        "button",
+      ) as HTMLButtonElement;
+      openTab.className = "llm-standalone-tab";
+      openTab.type = "button";
+      openTab.textContent = t("Library chat");
+      openTab.dataset.tab = "open";
+
+      paperTab.classList.toggle("active", standaloneMode === "paper");
+      openTab.classList.toggle("active", standaloneMode === "open");
+
+      const tabGroup = doc.createElementNS(HTML_NS, "div") as HTMLDivElement;
+      tabGroup.className = "llm-standalone-tab-group";
+      tabGroup.append(paperTab, openTab);
+
+      const standaloneRuntimeSystemControls = createRuntimeSystemControls(doc, {
+        groupClassName: "llm-standalone-runtime-system-controls",
+        buttonClassName: "llm-standalone-runtime-system-toggle",
+      });
+      const updateStandaloneSystemToggles = () => {
+        syncRuntimeSystemControls(standaloneRuntimeSystemControls, {
+          activeSystem: currentConversationSystem,
+          codexEnabled: isCodexAppServerModeEnabled(),
+          claudeEnabled: getClaudeCodeModeEnabled(),
+        });
+      };
+
+      // The leading slot is the tab row's single grid cell on the left. It
+      // holds the runtime controls; the window buttons and sidebar toggle
+      // join them whenever the sidebar is collapsed.
+      const tabRowLeading = doc.createElementNS(
+        HTML_NS,
+        "div",
+      ) as HTMLDivElement;
+      tabRowLeading.className = "llm-standalone-tab-row-leading";
+      tabRowLeading.append(standaloneRuntimeSystemControls.group);
+
+      const tabRow = doc.createElementNS(HTML_NS, "div") as HTMLDivElement;
+      tabRow.className = "llm-standalone-tab-row";
+      tabRow.append(tabRowLeading, tabGroup);
+
+      // -- Lower area: sidebar + content side by side --
+      const lowerArea = doc.createElementNS(HTML_NS, "div") as HTMLDivElement;
+      lowerArea.className = "llm-standalone-lower";
+
+      const sidebarView = createStandaloneSidebarView(doc, t);
+      disposeHistoryActivity = observeHistoryActivity(sidebarView.list);
+      const sidebar = sidebarView.root;
+      const sidebarPanel = sidebarView.panel;
+      const iconSidebarToggle = sidebarView.toggleButton;
+      const iconNewChat = sidebarView.newChatButton;
+      const iconSearch = sidebarView.searchButton;
+      const iconSkill = sidebarView.skillsButton;
+      const iconSettings = sidebarView.preferencesButton;
+      const webHistoryRefreshBtn = sidebarView.refreshButton;
+      const standaloneHistoryUndo = sidebarView.undo;
+      const standaloneHistoryUndoText = sidebarView.undoText;
+      const standaloneHistoryUndoBtn = sidebarView.undoButton;
+      const sidebarList = sidebarView.list;
+      const sidebarResizeHandle = sidebarView.resizeHandle;
+
+      // A collapsed sidebar renders nothing at all, so the window controls and
+      // the collapse toggle move into the tab row for as long as it is hidden,
+      // and hovering the toggle floats the sidebar back over the content.
+      setStandaloneSidebarCollapsedChromeHost(sidebarView, tabRowLeading);
+      cleanupStandaloneSidebarFlyout = installStandaloneSidebarFlyout({
+        win: newWin,
+        toggle: iconSidebarToggle,
+        panel: sidebarPanel,
+        isCollapsed: () => sidebar.dataset.sidebarState === "collapsed",
+        setOpen: (open) => setStandaloneSidebarFlyoutOpen(sidebarView, open),
+      });
+
+      // Export popup — floating menu from the content-title Export action
+      const exportPopup = doc.createElementNS(HTML_NS, "div") as HTMLDivElement;
+      exportPopup.className = "llm-standalone-export-popup";
+      exportPopup.style.display = "none";
+
+      const exportPopupCopyBtn = doc.createElementNS(
+        HTML_NS,
+        "button",
+      ) as HTMLButtonElement;
+      exportPopupCopyBtn.className = "llm-standalone-popup-item";
+      exportPopupCopyBtn.type = "button";
+      exportPopupCopyBtn.textContent = t("Copy chat as md");
+
+      const exportPopupNoteBtn = doc.createElementNS(
+        HTML_NS,
+        "button",
+      ) as HTMLButtonElement;
+      exportPopupNoteBtn.className = "llm-standalone-popup-item";
+      exportPopupNoteBtn.type = "button";
+      exportPopupNoteBtn.textContent = t("Save chat as note");
+
+      exportPopup.append(exportPopupCopyBtn, exportPopupNoteBtn);
+
+      let standaloneSidebarEntriesByKey = new Map<number, SidebarConv>();
+
+      // -- Content area --
+      const contentWrapper = doc.createElementNS(
+        HTML_NS,
+        "div",
+      ) as HTMLDivElement;
+      contentWrapper.className = "llm-standalone-content-wrapper";
+
+      const contentTitleBar = doc.createElementNS(
+        HTML_NS,
+        "div",
+      ) as HTMLDivElement;
+      contentTitleBar.className = "llm-standalone-content-title";
+
+      const contentTitleText = doc.createElementNS(
+        HTML_NS,
+        "span",
+      ) as HTMLSpanElement;
+      contentTitleText.className = "llm-standalone-content-title-text";
+
+      const contentTitleBarSpacer = doc.createElementNS(
+        HTML_NS,
+        "div",
+      ) as HTMLDivElement;
+      contentTitleBarSpacer.className = "llm-standalone-content-title-actions";
+
+      const iconExport = doc.createElementNS(
+        HTML_NS,
+        "button",
+      ) as HTMLButtonElement;
+      iconExport.className =
+        "llm-standalone-title-action llm-standalone-icon-export";
+      iconExport.type = "button";
+      iconExport.title = t("Export");
+      iconExport.setAttribute("aria-label", t("Export"));
+
+      const iconClear = doc.createElementNS(
+        HTML_NS,
+        "button",
+      ) as HTMLButtonElement;
+      iconClear.className =
+        "llm-standalone-title-action llm-standalone-icon-clear";
+      iconClear.type = "button";
+      iconClear.title = t("Delete conversation");
+      iconClear.setAttribute("aria-label", t("Delete conversation"));
+      contentTitleBarSpacer.append(iconExport, iconClear);
+      contentTitleBar.append(contentTitleText, contentTitleBarSpacer);
+
+      const contentArea = doc.createElementNS(HTML_NS, "div") as HTMLDivElement;
+      contentArea.className = "llm-standalone-content";
+      contentArea.dataset.standalone = "true";
+
+      contentWrapper.append(tabRow, contentTitleBar, contentArea);
+      lowerArea.append(sidebar, contentWrapper);
+
+      // -- Skills overlay (popup for managing agent skills) --
+      const skillOverlay = doc.createElementNS(
+        HTML_NS,
+        "div",
+      ) as HTMLDivElement;
+      skillOverlay.className = "llm-standalone-skill-overlay";
+      skillOverlay.style.display = "none";
+
+      const skillPopup = doc.createElementNS(HTML_NS, "div") as HTMLDivElement;
+      skillPopup.className = "llm-standalone-skill-popup";
+
+      const skillHeader = doc.createElementNS(HTML_NS, "div") as HTMLDivElement;
+      skillHeader.className = "llm-standalone-skill-header";
+
+      const skillTitle = doc.createElementNS(
+        HTML_NS,
+        "span",
+      ) as HTMLSpanElement;
+      skillTitle.className = "llm-standalone-skill-title";
+      skillTitle.textContent = t("Skills");
+
+      const skillRefreshBtn = doc.createElementNS(
+        HTML_NS,
+        "button",
+      ) as HTMLButtonElement;
+      skillRefreshBtn.className = "llm-outline-btn";
+      skillRefreshBtn.type = "button";
+      skillRefreshBtn.textContent = t("Check for updates");
+      skillRefreshBtn.title = t(
+        "Re-seed built-in skills and refresh the list. Customized files are kept — use the right-click menu to restore individual skills to default.",
+      );
+
+      const skillCloseBtn = doc.createElementNS(
+        HTML_NS,
+        "button",
+      ) as HTMLButtonElement;
+      skillCloseBtn.className = "llm-standalone-search-close";
+      skillCloseBtn.type = "button";
+      skillCloseBtn.textContent = "\u00D7";
+
+      skillHeader.append(skillTitle, skillRefreshBtn, skillCloseBtn);
+
+      const skillGrid = doc.createElementNS(HTML_NS, "div") as HTMLDivElement;
+      skillGrid.className = "llm-standalone-skill-grid";
+
+      skillPopup.append(skillHeader, skillGrid);
+      skillOverlay.appendChild(skillPopup);
+
+      // Skills context menu (right-click)
+      const skillCtxMenu = doc.createElementNS(
+        HTML_NS,
+        "div",
+      ) as HTMLDivElement;
+      skillCtxMenu.className = "llm-standalone-skill-ctx-menu";
+      skillCtxMenu.style.display = "none";
+
+      const skillCtxShowInFs = doc.createElementNS(
+        HTML_NS,
+        "button",
+      ) as HTMLButtonElement;
+      skillCtxShowInFs.className = "llm-standalone-skill-ctx-item";
+      skillCtxShowInFs.type = "button";
+      skillCtxShowInFs.textContent = t("Show in file system");
+
+      const skillCtxRestore = doc.createElementNS(
+        HTML_NS,
+        "button",
+      ) as HTMLButtonElement;
+      skillCtxRestore.className = "llm-standalone-skill-ctx-item";
+      skillCtxRestore.type = "button";
+      skillCtxRestore.textContent = t("Restore to default");
+      skillCtxRestore.style.display = "none"; // only shown for customized built-ins
+
+      const skillCtxDelete = doc.createElementNS(
+        HTML_NS,
+        "button",
+      ) as HTMLButtonElement;
+      skillCtxDelete.className =
+        "llm-standalone-skill-ctx-item llm-standalone-skill-ctx-delete";
+      skillCtxDelete.type = "button";
+      skillCtxDelete.textContent = t("Delete");
+
+      skillCtxMenu.append(skillCtxShowInFs, skillCtxRestore, skillCtxDelete);
+
+      root.append(lowerArea, exportPopup, skillOverlay, skillCtxMenu);
+      cleanupStandaloneVerticalResize = installStandaloneVerticalResizeBehavior(
+        newWin,
+        contentArea,
+        {
+          minWindowHeight: STANDALONE_MIN_HEIGHT_PX,
+        },
+      );
+      cleanupStandaloneSidebarResize = installStandaloneSidebarResizeBehavior(
+        newWin,
+        lowerArea,
+        sidebarPanel,
+        sidebarResizeHandle,
+        {
+          initialWidth: getStandaloneSidebarWidthPref(),
+          onWidthCommit: setStandaloneSidebarWidthPref,
+        },
+      );
+
+      // -- Sidebar state management --
+      let userManualSidebarState: "expanded" | "collapsed" | null = null;
+
+      const setSidebarState = (state: "expanded" | "collapsed") => {
+        setStandaloneSidebarState(sidebarView, state);
+      };
+
+      const toggleSidebar = () => {
+        const current = sidebar.dataset.sidebarState || "expanded";
+        const next = current === "expanded" ? "collapsed" : "expanded";
+        userManualSidebarState = next;
+        setSidebarState(next);
+      };
+
+      // -----------------------------------------------------------------------
+      // Helpers
+      // -----------------------------------------------------------------------
+      const clearContent = () => {
+        if (typeof (contentArea as any).replaceChildren === "function") {
+          (contentArea as any).replaceChildren();
+        } else {
+          contentArea.textContent = "";
+        }
+      };
+
+      const clearSidebarList = () => {
+        if (typeof (sidebarList as any).replaceChildren === "function") {
+          (sidebarList as any).replaceChildren();
+        } else {
+          sidebarList.textContent = "";
+        }
+      };
+
+      const getSelectedZoteroItem = (): Zotero.Item | null => {
+        try {
+          const activePane = Zotero.getActiveZoteroPane?.() as any;
+          const activeItems = activePane?.getSelectedItems?.();
+          if (activeItems?.[0]) {
+            return activeItems[0];
+          }
+        } catch {
+          void 0;
+        }
+        try {
+          const mainPane = (mainWin as any)?.ZoteroPane;
+          const mainItems = mainPane?.getSelectedItems?.();
+          return mainItems?.[0] || null;
+        } catch {
+          return null;
+        }
+      };
+
+      const syncPaperTabLabel = () => {
+        paperTab.textContent = t(
+          resolveStandalonePaperTabLabel({
+            isWebChat: isInWebChatMode,
+            isNoteSession: Boolean(resolveActiveNoteSession(activeItem)),
+          }),
+        );
+      };
+
+      const getCurrentLibraryScopeID = (): number => {
+        const activeLibraryID = Number(activeItem?.libraryID || 0);
+        if (Number.isFinite(activeLibraryID) && activeLibraryID > 0) {
+          return Math.floor(activeLibraryID);
+        }
+        const paperLibraryID = Number(
+          currentBasePaperItem?.libraryID || currentPaperItem?.libraryID || 0,
+        );
+        if (Number.isFinite(paperLibraryID) && paperLibraryID > 0) {
+          return Math.floor(paperLibraryID);
+        }
+        return libraryID;
+      };
+
+      const getLibraryIDForPaperItem = (
+        paperItem: Zotero.Item | null | undefined,
+      ): number => {
+        const value = Number(paperItem?.libraryID || 0);
+        return Number.isFinite(value) && value > 0
+          ? Math.floor(value)
+          : getCurrentLibraryScopeID();
+      };
+
+      const getCurrentPaperLibraryID = (): number => {
+        const value = Number(
+          currentBasePaperItem?.libraryID ||
+            currentPaperItem?.libraryID ||
+            getCurrentLibraryScopeID(),
+        );
+        return Number.isFinite(value) && value > 0
+          ? Math.floor(value)
+          : getCurrentLibraryScopeID();
+      };
+
+      const ensureConversationCatalogEntry = async (params: {
+        conversationKey?: number;
+        libraryID: number;
+        kind: "global" | "paper";
+        paperItemID?: number;
+      }) =>
+        conversationRepository.ensureCatalogEntry({
+          system: currentConversationSystem,
+          conversationKey: params.conversationKey,
+          libraryID: params.libraryID,
+          kind: params.kind,
+          paperItemID: params.paperItemID,
+        });
+
+      // Ambient sidebar seeding: never resurrect a key whose deletion is queued
+      // or just committed. A keyless paper ensure is a plain "give this paper a
+      // conversation" request and stays allowed.
+      const ensureActiveConversationCatalogEntry = async (params: {
+        conversationKey?: number;
+        libraryID: number;
+        kind: "global" | "paper";
+        paperItemID?: number;
+      }) => {
+        const key = Number(params.conversationKey || 0);
+        if (
+          key > 0 &&
+          pendingDeletionStore.isConversationPendingDeletion(key)
+        ) {
+          return null;
+        }
+        if (key > 0) {
+          const identityWitness =
+            await conversationRepository.getCatalogIdentityWitness({
+              system: currentConversationSystem,
+              kind: params.kind,
+              conversationKey: key,
+            });
+          if (
+            identityWitness?.instanceID &&
+            isConversationInstanceRecentlyDeleted(
+              key,
+              identityWitness.instanceID,
+            )
+          ) {
+            return null;
+          }
+          if (
+            !identityWitness &&
+            (await hasConversationDeletionTombstoneForKey(key))
+          ) {
+            return null;
+          }
+        }
+        return ensureConversationCatalogEntry(params);
+      };
+
+      const toSidebarConversation = (
+        entry: ConversationCatalogEntry,
+      ): SidebarConv => ({
+        conversationID: entry.conversationID,
+        conversationKey: entry.conversationKey,
+        kind: entry.kind,
+        libraryID: entry.libraryID,
+        lastActivityAt: entry.lastActivityAt || entry.createdAt || 0,
+        title: entry.title,
+        userTurnCount: entry.userTurnCount,
+        sessionVersion: entry.sessionVersion,
+        paperItemID: entry.paperItemID,
+        providerSessionId: entry.providerSessionId,
+        scopedConversationKey: entry.scopedConversationKey,
+        conversationSystem: entry.system,
+        mode: entry.kind === "paper" ? "paper" : "open",
+      });
+
+      // -----------------------------------------------------------------------
+      // Webchat mode UI updates for standalone window
+      // -----------------------------------------------------------------------
+      const updateStandaloneWebChatUI = (isWebChat: boolean) => {
+        if (cancelled) return;
+        isInWebChatMode = isWebChat;
+        updateStandaloneSystemToggles();
+
+        // Tab labels
+        if (isWebChat) {
+          syncPaperTabLabel();
+          paperTab.classList.add("active");
+          openTab.classList.remove("active");
+          // Force paper tab active since webchat uses that slot
+          if (standaloneMode !== "paper") {
+            standaloneMode = "paper";
+          }
+        } else {
+          // Restore the paper-slot label, not the currently mounted panel item.
+          syncPaperTabLabel();
+          paperTab.classList.toggle("active", standaloneMode === "paper");
+          openTab.classList.toggle("active", standaloneMode === "open");
+        }
+
+        // Delete/Exit action — show "Exit" text only in WebChat.
+        const deleteOrExitLabel = isWebChat
+          ? t("Exit webchat and return to previous model")
+          : t("Delete conversation");
+        iconClear.title = deleteOrExitLabel;
+        iconClear.setAttribute("aria-label", deleteOrExitLabel);
+        iconClear.textContent = isWebChat ? t("Exit") : "";
+        iconClear.classList.toggle("llm-standalone-icon-exit", isWebChat);
+
+        // Keep original paper title — webchat mode is already indicated by tabs/mode chip
+        updateContentTitle();
+        webHistoryRefreshBtn.style.display = isWebChat ? "inline-flex" : "none";
+
+        // Sidebar: populate with webchat history, or restore local history
+        if (isWebChat) {
+          void renderWebChatSidebar();
+        } else {
+          scheduleStandaloneSidebarRender();
+        }
+      };
+
+      const resolveActiveWebChatHostname = async (): Promise<string | null> => {
+        const [
+          { relayGetStateSnapshot },
+          { getWebChatTargetByModelName, WEBCHAT_TARGETS },
+        ] = await Promise.all([
+          import("../../webchat/relayServer"),
+          import("../../webchat/types"),
+        ]);
+        const currentModelName =
+          currentChatHooks?.getCurrentModelName?.() || null;
+        const currentTargetHostname =
+          getWebChatTargetByModelName(currentModelName || "")?.modelName ||
+          null;
+        if (currentTargetHostname) {
+          return currentTargetHostname;
+        }
+        const activeTarget = relayGetStateSnapshot().active_target || null;
+        return (
+          WEBCHAT_TARGETS.find((target) => target.id === activeTarget)
+            ?.modelName || null
+        );
+      };
+
+      // Render webchat history items directly into the sidebar list
+      let webChatSidebarRenderSeq = 0;
+      const renderWebChatSidebar = async () => {
+        if (cancelled || !isInWebChatMode) return;
+        const mySeq = ++webChatSidebarRenderSeq;
+        webHistoryRefreshBtn.disabled = true;
+        clearSidebarList();
+
+        // Loading indicator
+        const loadingEl = doc.createElementNS(HTML_NS, "div") as HTMLDivElement;
+        loadingEl.className = "llm-standalone-sidebar-empty";
+        loadingEl.textContent = t("Fetching…");
+        sidebarList.appendChild(loadingEl);
+
+        try {
+          const requestedAt = Date.now();
+          const [
+            { relaySetCommand },
+            {
+              filterWebChatHistorySessionsForHostname,
+              getWebChatHistorySiteSyncEntry,
+              isWebChatHistorySiteFailure,
+              waitForFreshChatHistorySnapshot,
+            },
+          ] = await Promise.all([
+            import("../../webchat/relayServer"),
+            import("../../webchat/client"),
+          ]);
+          const targetHostname = await resolveActiveWebChatHostname();
+
+          relaySetCommand({ type: "SCRAPE_HISTORY" });
+
+          let sessions: Array<{
+            id: string;
+            title: string;
+            chatUrl: string | null;
+          }> = [];
+          let historyFetchFailed = false;
+          try {
+            const snapshot = await waitForFreshChatHistorySnapshot(
+              "",
+              targetHostname,
+              requestedAt,
+            );
+            sessions = filterWebChatHistorySessionsForHostname(
+              snapshot.sessions,
+              targetHostname,
+            );
+            historyFetchFailed = isWebChatHistorySiteFailure(
+              getWebChatHistorySiteSyncEntry(snapshot, targetHostname),
+            );
+          } catch {
+            /* relay not reachable */
+          }
+
+          if (
+            cancelled ||
+            !isInWebChatMode ||
+            mySeq !== webChatSidebarRenderSeq
+          )
+            return;
+          loadingEl.remove();
+
+          if (!sessions.length) {
+            const emptyEl = doc.createElementNS(
+              HTML_NS,
+              "div",
+            ) as HTMLDivElement;
+            emptyEl.className = "llm-standalone-sidebar-empty";
+            emptyEl.textContent = historyFetchFailed
+              ? t("Failed to fetch history")
+              : t("No conversations yet");
+            sidebarList.appendChild(emptyEl);
+            return;
+          }
+
+          for (const session of sessions) {
+            const row = doc.createElementNS(
+              HTML_NS,
+              "button",
+            ) as HTMLButtonElement;
+            row.className = "llm-standalone-conv-item";
+            row.type = "button";
+            row.title = session.title || "Untitled";
+
+            const titleEl = doc.createElementNS(
+              HTML_NS,
+              "span",
+            ) as HTMLSpanElement;
+            titleEl.className = "llm-standalone-conv-title";
+            titleEl.textContent = session.title || "Untitled";
+
+            row.appendChild(titleEl);
+            row.addEventListener("click", () => {
+              if (!activeItem) return;
+              // Load the webchat conversation
+              void (async () => {
+                const key = getConversationKey(activeItem);
+                const { getWebChatTargetByUrl } =
+                  await import("../../webchat/types");
+                const sessionTarget = getWebChatTargetByUrl(session.chatUrl);
+                const isDeepSeekSession = sessionTarget?.id === "deepseek";
+                try {
+                  const loadModelName =
+                    sessionTarget?.modelName || "chatgpt.com";
+
+                  webChatIsolatedConversationKeys.add(key);
+                  loadedConversationKeys.add(key);
+                  chatHistory.set(key, [
+                    {
+                      role: "assistant" as const,
+                      text: `Loading conversation: **${session.title || "Untitled"}**\n\nFetching messages…`,
+                      timestamp: Date.now(),
+                      modelName: loadModelName,
+                      modelProviderLabel: "WebChat",
+                      streaming: true,
+                    },
+                  ]);
+                  refreshChat(contentArea, activeItem);
+
+                  // Clear force-new-chat intent so follow-up sends
+                  // continue in the loaded conversation, not start fresh.
+                  currentChatHooks?.clearWebChatNewChatIntent?.();
+
+                  const { loadChatSession } =
+                    await import("../../webchat/client");
+                  const result = await loadChatSession("", session.id);
+
+                  if (cancelled || !isInWebChatMode) return;
+
+                  const messages: Array<{
+                    role: "user" | "assistant";
+                    text: string;
+                    timestamp: number;
+                    modelName?: string;
+                    modelProviderLabel?: string;
+                    reasoningDetails?: string;
+                    webchatChatUrl?: string;
+                    webchatChatId?: string;
+                  }> = [];
+
+                  if (result?.messages?.length) {
+                    for (const m of result.messages) {
+                      messages.push({
+                        role: m.kind === "user" ? "user" : "assistant",
+                        text: m.text || "",
+                        timestamp: m.timestamp
+                          ? new Date(m.timestamp).getTime()
+                          : Date.now(),
+                        modelName: m.kind === "bot" ? loadModelName : undefined,
+                        modelProviderLabel:
+                          m.kind === "bot" ? "WebChat" : undefined,
+                        reasoningDetails: m.thinking || undefined,
+                        webchatChatUrl:
+                          m.kind === "bot"
+                            ? session.chatUrl || undefined
+                            : undefined,
+                        webchatChatId:
+                          m.kind === "bot" ? session.id : undefined,
+                      });
+                    }
+                  }
+
+                  chatHistory.set(key, messages);
+                  loadedConversationKeys.add(key);
+                  webChatIsolatedConversationKeys.add(key);
+                  refreshChat(contentArea, activeItem);
+                } catch (err) {
+                  appLogger.warn(
+                    "LLM: standalone webchat sidebar load failed",
+                    err,
+                  );
+                  chatHistory.set(key, [
+                    {
+                      role: "assistant" as const,
+                      text: isDeepSeekSession
+                        ? t("Failed to load selected DeepSeek conversation")
+                        : t("Failed to load selected conversation"),
+                      timestamp: Date.now(),
+                      modelProviderLabel: "WebChat",
+                    },
+                  ]);
+                  loadedConversationKeys.add(key);
+                  webChatIsolatedConversationKeys.add(key);
+                  refreshChat(contentArea, activeItem);
+                }
+              })();
+            });
+
+            sidebarList.appendChild(row);
+          }
+        } catch (err) {
+          appLogger.warn("LLM: standalone webchat sidebar fetch failed", err);
+          loadingEl.textContent = t("Failed to fetch history");
+        } finally {
+          webHistoryRefreshBtn.disabled = false;
+        }
+      };
+
+      webHistoryRefreshBtn.addEventListener("click", () => {
+        if (cancelled || !isInWebChatMode || webHistoryRefreshBtn.disabled)
+          return;
+        void renderWebChatSidebar();
+      });
+
+      // -----------------------------------------------------------------------
+      // Mount chat UI into contentArea
+      // -----------------------------------------------------------------------
+      const updateContentTitle = () => {
+        if (standaloneMode === "paper" && currentBasePaperItem) {
+          try {
+            const title =
+              (currentBasePaperItem as any).getField?.("title") || "";
+            contentTitleText.textContent = title || "Paper chat";
+          } catch {
+            contentTitleText.textContent = "Paper chat";
+          }
+        } else {
+          contentTitleText.textContent = "Library chat";
+        }
+      };
+
+      const buildStandalonePortalItem = (params: {
+        mode: "open" | "paper";
+        conversationKey: number;
+        paperItem?: Zotero.Item | null;
+        sessionVersion?: number;
+      }): Zotero.Item | null => {
+        if (params.mode === "open") {
+          return isClaudeConversationSystem()
+            ? (createClaudeGlobalPortalItem(
+                getCurrentLibraryScopeID(),
+                params.conversationKey,
+              ) as Zotero.Item)
+            : isCodexConversationSystem()
+              ? (createCodexGlobalPortalItem(
+                  getCurrentLibraryScopeID(),
+                  params.conversationKey,
+                ) as Zotero.Item)
+              : createGlobalPortalItem(
+                  getCurrentLibraryScopeID(),
+                  params.conversationKey,
+                );
+        }
+        if (!params.paperItem) return null;
+        return isClaudeConversationSystem()
+          ? (createClaudePaperPortalItem(
+              params.paperItem,
+              params.conversationKey,
+            ) as Zotero.Item)
+          : isCodexConversationSystem()
+            ? (createCodexPaperPortalItem(
+                params.paperItem,
+                params.conversationKey,
+              ) as Zotero.Item)
+            : createPaperPortalItem(
+                params.paperItem,
+                params.conversationKey,
+                params.sessionVersion || 1,
+              );
+      };
+
+      const scheduleStandaloneSidebarRender = () => {
+        if (cancelled || standaloneSidebarRenderQueued) return;
+        standaloneSidebarRenderQueued = true;
+        newWin.setTimeout(() => {
+          standaloneSidebarRenderQueued = false;
+          void renderSidebar();
+        }, 0);
+      };
+
+      const mountChatPanel = (
+        nextItem: Zotero.Item,
+        rawContextItem?: Zotero.Item | null,
+      ) => {
+        const mountGeneration = ++standaloneMountGeneration;
+        const isCurrentMount = () =>
+          !cancelled &&
+          !newWin.closed &&
+          mountGeneration === standaloneMountGeneration;
+        const resolvedState = resolveInitialPanelItemState(nextItem, {
+          conversationSystem: currentConversationSystem,
+          conversationMode: standaloneMode === "open" ? "global" : "paper",
+        });
+        const mountedItem = resolvedState.item || nextItem;
+        const rawItemForPanel =
+          rawContextItem ||
+          currentRawContextItem ||
+          resolveConversationBaseItem(mountedItem) ||
+          mountedItem;
+        try {
+          currentRawContextItem = rawItemForPanel;
+          activeItem = mountedItem;
+          currentConversationSystem =
+            resolveConversationSystemForItem(mountedItem) ||
+            currentConversationSystem;
+          activeConversationKey = getConversationKey(mountedItem);
+          if (
+            initialRuntimeMode &&
+            !initialRuntimeModeSeeded &&
+            !isRuntimeConversationSystem()
+          ) {
+            if (!selectedRuntimeModeCache.has(activeConversationKey)) {
+              selectedRuntimeModeCache.set(
+                activeConversationKey,
+                initialRuntimeMode,
+              );
+            }
+            initialRuntimeModeSeeded = true;
+          } else if (initialRuntimeMode && !initialRuntimeModeSeeded) {
+            initialRuntimeModeSeeded = true;
+          }
+
+          if (standaloneMode === "paper" && currentBasePaperItem) {
+            const paperItemID = Number(currentBasePaperItem.id || 0);
+            if (paperItemID > 0) {
+              const paperLibraryID = getCurrentPaperLibraryID();
+              if (isClaudeConversationSystem()) {
+                activeClaudePaperConversationByPaper.set(
+                  buildClaudePaperStateKey(paperLibraryID, paperItemID),
+                  activeConversationKey,
+                );
+              } else if (isCodexConversationSystem()) {
+                activeCodexPaperConversationByPaper.set(
+                  buildCodexPaperStateKey(paperLibraryID, paperItemID),
+                  activeConversationKey,
+                );
+                setLastUsedCodexPaperConversationKey(
+                  paperLibraryID,
+                  paperItemID,
+                  activeConversationKey,
+                );
+              } else {
+                activePaperConversationByPaper.set(
+                  buildPaperStateKey(paperLibraryID, paperItemID),
+                  activeConversationKey,
+                );
+              }
+            }
+          }
+
+          clearContent();
+          updateContentTitle();
+
+          buildUI(contentArea, mountedItem);
+
+          // The left tab represents the preserved paper-side slot, so do not
+          // derive its label from a mounted global portal item.
+          syncPaperTabLabel();
+
+          const llmMain = contentArea.querySelector(
+            "#llm-main",
+          ) as HTMLElement | null;
+          if (llmMain) llmMain.dataset.standalone = "true";
+
+          bindStandalonePanelHost(contentArea, mountedItem);
+          activeContextPanels.set(contentArea, () => activeItem);
+          activeContextPanelRawItems.set(contentArea, rawItemForPanel);
+          void retainClaudeRuntimeForBody(contentArea, mountedItem);
+          let standaloneInputFitRequestId = 0;
+          const cancelPendingStandaloneInputFit = () => {
+            standaloneInputFitRequestId += 1;
+          };
+          const scheduleStandaloneInputFit = () => {
+            if (cancelled || newWin.closed) return;
+            const fitRequestId = (standaloneInputFitRequestId += 1);
+            const inputSection = contentArea.querySelector(
+              ".llm-input-section",
+            ) as HTMLElement | null;
+            scheduleStandaloneWindowFitForElement(newWin, inputSection, {
+              shouldRun: () => fitRequestId === standaloneInputFitRequestId,
+            });
+          };
+          const scheduleStandaloneInputFitAfterContextPreviewRender = (
+            metrics: ContextPreviewRenderMetrics,
+          ) => {
+            if (metrics.nextHeight <= metrics.previousHeight) {
+              cancelPendingStandaloneInputFit();
+              return;
+            }
+            scheduleStandaloneInputFit();
+          };
+          const chatHooks: SetupHandlersHooks = {
+            onConversationHistoryChanged: () => {
+              if (cancelled) return;
+              scheduleStandaloneSidebarRender();
+            },
+            onDefaultContextRendered: scheduleStandaloneInputFit,
+            onContextPreviewRendered:
+              scheduleStandaloneInputFitAfterContextPreviewRender,
+            onWebChatModeChanged: (isWebChat) => {
+              if (cancelled) return;
+              updateStandaloneWebChatUI(isWebChat);
+            },
+            prepareItemsAsDefaultContextTarget: async () => {
+              if (cancelled || newWin.closed) return;
+              return await createStandaloneOpenConversationForContext();
+            },
+          };
+          setupHandlers(contentArea, mountedItem as any, chatHooks);
+          // Store hooks reference so webchat load handlers can call clearWebChatNewChatIntent
+          currentChatHooks = chatHooks;
+
+          refreshChat(contentArea, mountedItem);
+          applyPanelFontScale(llmMain);
+          applyPanelFontScale(root);
+          const shortcutMode = standaloneMode === "open" ? "library" : "paper";
+          void renderShortcuts(contentArea, mountedItem, shortcutMode);
+        } catch (err) {
+          appLogger.warn("LLM: standalone mountChatPanel sync failed", err);
+        }
+
+        void (async () => {
+          try {
+            if (!isCurrentMount()) return;
+            await ensureConversationLoaded(mountedItem);
+            if (!isCurrentMount()) return;
+            refreshChat(contentArea, mountedItem);
+            // Refresh sidebar after conversation is confirmed loaded
+            scheduleStandaloneSidebarRender();
+          } catch (err) {
+            appLogger.warn("LLM: standalone mount async failed", err);
+          }
+        })();
+      };
+
+      // -----------------------------------------------------------------------
+      // Sidebar rendering — supports both open chat and paper chat
+      // -----------------------------------------------------------------------
+      const renderSidebarItems = (conversations: SidebarConv[]) => {
+        clearSidebarList();
+        const visibleConversations =
+          collapseDuplicateReusableConversationDrafts({
+            entries: conversations,
+            activeConversationKey,
+          }).filter(
+            (conv) =>
+              !pendingDeletionStore.isConversationPendingDeletion(
+                conv.conversationKey,
+              ),
+          );
+        standaloneSidebarEntriesByKey = new Map(
+          conversations.map((conv) => [conv.conversationKey, conv]),
+        );
+
+        if (visibleConversations.length === 0) {
+          const emptyMsg = doc.createElementNS(
+            HTML_NS,
+            "div",
+          ) as HTMLDivElement;
+          emptyMsg.className = "llm-standalone-sidebar-empty";
+          emptyMsg.textContent = t("No conversations yet");
+          sidebarList.appendChild(emptyMsg);
+          return;
+        }
+
+        const groups = groupHistoryEntriesByDay(visibleConversations, {
+          translate: t,
+        });
+        for (const group of groups) {
+          const dayLabel = doc.createElementNS(
+            HTML_NS,
+            "div",
+          ) as HTMLDivElement;
+          dayLabel.className = "llm-standalone-day-label";
+          dayLabel.textContent = group.label;
+          sidebarList.appendChild(dayLabel);
+
+          for (const conv of group.items) {
+            const btn = doc.createElementNS(HTML_NS, "div") as HTMLDivElement;
+            btn.className = "llm-standalone-conv-item";
+            if (conv.conversationKey === activeConversationKey) {
+              btn.classList.add("active");
+            }
+            btn.setAttribute("role", "button");
+            btn.tabIndex = 0;
+            btn.dataset.conversationKey = String(conv.conversationKey);
+            if (conv.sessionVersion !== undefined) {
+              btn.dataset.sessionVersion = String(conv.sessionVersion);
+            }
+            const titleSpan = doc.createElementNS(
+              HTML_NS,
+              "span",
+            ) as HTMLSpanElement;
+            titleSpan.className = "llm-standalone-conv-title";
+            titleSpan.textContent = conv.title || t("Untitled chat");
+            const renameBtn = doc.createElementNS(
+              HTML_NS,
+              "button",
+            ) as HTMLButtonElement;
+            renameBtn.className = "llm-standalone-conv-rename";
+            renameBtn.type = "button";
+            renameBtn.setAttribute("aria-label", t("Rename chat"));
+            renameBtn.title = t("Rename chat");
+            renameBtn.dataset.action = "rename";
+            const deleteBtn = doc.createElementNS(
+              HTML_NS,
+              "button",
+            ) as HTMLButtonElement;
+            deleteBtn.className = "llm-standalone-conv-delete";
+            deleteBtn.type = "button";
+            deleteBtn.setAttribute("aria-label", t("Delete conversation"));
+            deleteBtn.title = t("Delete conversation");
+            deleteBtn.dataset.action = "delete";
+            btn.append(
+              createHistoryActivityIndicator(
+                doc,
+                conv.conversationKey,
+                t("Working"),
+              ),
+              titleSpan,
+              renameBtn,
+              deleteBtn,
+            );
+            btn.title = conv.title || t("Untitled chat");
+            sidebarList.appendChild(btn);
+          }
+        }
+      };
+
+      const renderSidebar = async () => {
+        if (cancelled) return;
+        // In webchat mode, sidebar is managed by renderWebChatSidebar() — skip local rendering
+        if (isInWebChatMode) return;
+        appLogger.debug(
+          "LLM: standalone renderSidebar",
+          "mode=" + standaloneMode,
+          "hasBasePaper=" + Boolean(currentBasePaperItem),
+          "basePaperId=" + (currentBasePaperItem?.id ?? "null"),
+          "activeConvKey=" + activeConversationKey,
+        );
+        try {
+          if (standaloneMode === "open") {
+            const currentLibraryID = getCurrentLibraryScopeID();
+            if (activeConversationKey > 0) {
+              await ensureActiveConversationCatalogEntry({
+                conversationKey: activeConversationKey,
+                libraryID: currentLibraryID,
+                kind: "global",
+              });
+            }
+            const conversations = (
+              await conversationRepository.listCatalogEntries({
+                system: currentConversationSystem,
+                kind: "global",
+                libraryID: currentLibraryID,
+                limit: 50,
+                includeEmpty: true,
+              })
+            ).map(toSidebarConversation);
+            if (cancelled) return;
+            renderSidebarItems(conversations);
+          } else {
+            if (!currentBasePaperItem) {
+              appLogger.debug(
+                "LLM: standalone renderSidebar paper mode — currentBasePaperItem is null",
+              );
+              clearSidebarList();
+              return;
+            }
+            const paperID = Number(currentBasePaperItem.id || 0);
+            const paperLibID = Number(
+              currentBasePaperItem.libraryID || libraryID,
+            );
+            appLogger.debug(
+              "LLM: standalone renderSidebar paper query",
+              "paperID=" + paperID,
+              "libraryID=" + paperLibID,
+            );
+            await ensureActiveConversationCatalogEntry({
+              conversationKey:
+                activeConversationKey > 0 ? activeConversationKey : undefined,
+              libraryID: paperLibID,
+              kind: "paper",
+              paperItemID: paperID,
+            });
+            const conversations = (
+              await conversationRepository.listCatalogEntries({
+                system: currentConversationSystem,
+                kind: "paper",
+                libraryID: paperLibID,
+                paperItemID: paperID,
+                limit: 50,
+                includeEmpty: true,
+              })
+            ).map(toSidebarConversation);
+            if (cancelled) return;
+            renderSidebarItems(conversations);
+          }
+        } catch (err) {
+          appLogger.warn("LLM: standalone sidebar render failed", err);
+        }
+      };
+
+      // -----------------------------------------------------------------------
+      // Search popup logic
+      // -----------------------------------------------------------------------
+      const searchDocCache = new Map<
+        number,
+        { fingerprint: string; document: HistorySearchDocument }
+      >();
+
+      const resolvePaperLabel = (paperItemID: number | undefined): string => {
+        if (!paperItemID) return t("Library chat");
+        try {
+          const paperItem = resolveHistoryEntryPaperBaseItem(
+            { paperItemID },
+            (id) => Zotero.Items.get(id) as Zotero.Item | null,
+          );
+          if (!paperItem) return t("Paper chat");
+          let firstCreator = "";
+          let year = "";
+          try {
+            firstCreator = (paperItem as any).getField("firstCreator") || "";
+          } catch {
+            /* */
+          }
+          try {
+            year = (paperItem as any).getField("year") || "";
+          } catch {
+            /* */
+          }
+          if (firstCreator && year) return `${firstCreator}, ${year}`;
+          if (firstCreator) return firstCreator;
+          if (year) return year;
+          return t("Paper chat");
+        } catch {
+          return t("Paper chat");
+        }
+      };
+
+      const resolvePaperSearchScopeLabel = (
+        paperItemID: number | undefined,
+        sourceState: ConversationHistoryEntry["sourceState"] = "active",
+      ): string => {
+        if (sourceState === "orphan") return t("Orphan");
+        if (!paperItemID) return t("Library chat");
+        try {
+          const paperItem = resolveHistoryEntryPaperBaseItem(
+            { paperItemID },
+            (id) => Zotero.Items.get(id) as Zotero.Item | null,
+          );
+          const title = String(paperItem?.getField?.("title") || "").trim();
+          return title || resolvePaperLabel(paperItemID);
+        } catch {
+          return resolvePaperLabel(paperItemID);
+        }
+      };
+
+      const toStandaloneHistoryEntry = (
+        entry: SidebarConv,
+      ): ConversationHistoryEntry => {
+        const isPaper = entry.mode === "paper";
+        const title = normalizeHistoryTitle(entry.title) || t("Untitled chat");
+        const sourceState = resolveHistoryEntrySourceState(
+          {
+            kind: isPaper ? "paper" : "global",
+            paperItemID: entry.paperItemID,
+          },
+          (id) => Zotero.Items.get(id) as Zotero.Item | null,
+        );
+        return {
+          kind: isPaper ? "paper" : "global",
+          sourceState,
+          section: isPaper ? "paper" : "open",
+          sectionTitle: isPaper
+            ? resolvePaperSearchScopeLabel(entry.paperItemID, sourceState)
+            : t("Library chat"),
+          conversationID: entry.conversationID,
+          conversationKey: entry.conversationKey,
+          libraryID: entry.libraryID || getCurrentLibraryScopeID(),
+          title,
+          timestampText:
+            formatGlobalHistoryTimestamp(entry.lastActivityAt) ||
+            (isPaper ? t("Paper chat") : t("Library chat")),
+          deletable: true,
+          isDraft: false,
+          isPendingDelete: false,
+          lastActivityAt: entry.lastActivityAt,
+          userTurnCount: entry.userTurnCount,
+          paperItemID: entry.paperItemID,
+          sessionVersion: entry.sessionVersion,
+          providerSessionId: entry.providerSessionId,
+          scopedConversationKey: entry.scopedConversationKey,
+        };
+      };
+
+      const loadAllStandaloneSearchEntries = async (): Promise<
+        ConversationHistoryEntry[]
+      > => {
+        const libraryID = getCurrentLibraryScopeID();
+        const limit = 100;
+        let entries: SidebarConv[];
+        if (isClaudeConversationSystem()) {
+          entries = (
+            await loadAllClaudeConversationHistory({ libraryID, limit })
+          ).map((entry) => ({
+            conversationKey: entry.conversationKey,
+            conversationID: entry.conversationID,
+            libraryID,
+            lastActivityAt: entry.lastActivityAt,
+            title: entry.title,
+            userTurnCount: entry.userTurnCount,
+            paperItemID: entry.paperItemID,
+            providerSessionId: entry.providerSessionId,
+            scopedConversationKey: entry.scopedConversationKey,
+            mode: entry.kind === "paper" ? "paper" : "open",
+          }));
+        } else if (isCodexConversationSystem()) {
+          entries = (
+            await loadAllCodexConversationHistory({ libraryID, limit })
+          ).map((entry) => ({
+            conversationKey: entry.conversationKey,
+            conversationID: entry.conversationID,
+            libraryID,
+            lastActivityAt: entry.lastActivityAt,
+            title: entry.title,
+            userTurnCount: entry.userTurnCount,
+            paperItemID: entry.paperItemID,
+            providerSessionId: entry.providerSessionId,
+            scopedConversationKey: entry.scopedConversationKey,
+            mode: entry.kind === "paper" ? "paper" : "open",
+          }));
+        } else {
+          entries = (
+            await loadAllConversationHistory({ libraryID, limit })
+          ).map((entry) => ({
+            conversationKey: entry.conversationKey,
+            conversationID: entry.conversationID,
+            libraryID,
+            lastActivityAt: entry.lastActivityAt,
+            title: entry.title,
+            userTurnCount: entry.userTurnCount,
+            sessionVersion: entry.sessionVersion,
+            paperItemID: entry.paperItemID,
+            mode: entry.mode,
+          }));
+        }
+        return entries
+          .map(toStandaloneHistoryEntry)
+          .filter(
+            (entry) =>
+              !pendingDeletionStore.isConversationPendingDeletion(
+                entry.conversationKey,
+              ),
+          );
+      };
+
+      const loadStandaloneSearchDocument = async (
+        entry: ConversationHistoryEntry,
+      ): Promise<HistorySearchDocument> => {
+        const fingerprint = createHistorySearchDocumentFingerprint(entry);
+        const cached = searchDocCache.get(entry.conversationKey);
+        if (cached?.fingerprint === fingerprint) return cached.document;
+        const messages = await conversationRepository.loadMessages({
+          system: currentConversationSystem,
+          conversationKey: entry.conversationKey,
+          limit: 200,
+        });
+        const document = createHistorySearchDocument(entry, messages);
+        searchDocCache.set(entry.conversationKey, { fingerprint, document });
+        return document;
+      };
+
+      const getCurrentStandaloneHistoryPaperItemID = (): number => {
+        return normalizeHistoryPaperItemID(currentBasePaperItem?.id);
+      };
+
+      const maybeSelectStandaloneHistoryPaperItem = async (
+        decision: ReturnType<typeof resolvePaperHistoryNavigationDecision>,
+        paperItem: Zotero.Item,
+      ): Promise<boolean> => {
+        try {
+          return await maybeSelectPaperHistoryTarget({
+            decision,
+            paperItemID: paperItem.id,
+            getPane: () =>
+              Zotero.getActiveZoteroPane?.() as
+                | HistoryPaperPaneSelector
+                | undefined,
+          });
+        } catch (err) {
+          appLogger.warn("LLM: Failed to select standalone history paper", {
+            paperItemID: paperItem.id,
+            error: err,
+          });
+          return false;
+        }
+      };
+
+      const selectStandaloneSearchEntry = async (
+        entry: ConversationHistoryEntry,
+      ): Promise<boolean> => {
+        try {
+          if (entry.kind === "paper") {
+            if (isOrphanHistoryEntry(entry)) {
+              const statusEl = contentArea.querySelector(
+                "#llm-status",
+              ) as HTMLElement | null;
+              if (statusEl) {
+                setStatus(
+                  statusEl,
+                  t("This chat's source item was deleted"),
+                  "warning",
+                );
+              }
+              return false;
+            }
+            const paperItem = resolveHistoryEntryPaperBaseItem(
+              entry,
+              (id) => Zotero.Items.get(id) as Zotero.Item | null,
+            );
+            if (!paperItem) {
+              const statusEl = contentArea.querySelector(
+                "#llm-status",
+              ) as HTMLElement | null;
+              if (statusEl) {
+                setStatus(
+                  statusEl,
+                  t("This chat's source item was deleted"),
+                  "warning",
+                );
+              }
+              return false;
+            }
+            const navigationDecision = resolvePaperHistoryNavigationDecision({
+              entryPaperItemID: paperItem.id,
+              currentPaperItemID: getCurrentStandaloneHistoryPaperItemID(),
+            });
+            if (navigationDecision === "missing-target-paper") {
+              const statusEl = contentArea.querySelector(
+                "#llm-status",
+              ) as HTMLElement | null;
+              if (statusEl) {
+                setStatus(statusEl, t("Could not find this paper"), "error");
+              }
+              return false;
+            }
+            const sessionVersion = Number(entry.sessionVersion || 0);
+            const sv = sessionVersion > 0 ? sessionVersion : 1;
+            const portalItem = buildStandalonePortalItem({
+              mode: "paper",
+              conversationKey: entry.conversationKey,
+              paperItem,
+              sessionVersion: sv,
+            });
+            if (!portalItem) return false;
+            const targetModeSnapshot = primeHistoryNavigationMode({
+              system: currentConversationSystem,
+              libraryID:
+                Number(entry.libraryID || 0) ||
+                Number(paperItem.libraryID || 0) ||
+                getCurrentLibraryScopeID(),
+              mode: "paper",
+              conversationKey: entry.conversationKey,
+              paperItemID: paperItem.id,
+            });
+            let mounted = false;
+            try {
+              if (navigationDecision === "select-target-paper") {
+                const selected = await maybeSelectStandaloneHistoryPaperItem(
+                  navigationDecision,
+                  paperItem,
+                );
+                if (!selected) {
+                  const statusEl = contentArea.querySelector(
+                    "#llm-status",
+                  ) as HTMLElement | null;
+                  if (statusEl) {
+                    setStatus(
+                      statusEl,
+                      t("Could not focus this paper"),
+                      "error",
+                    );
+                  }
+                  return false;
+                }
+              }
+              standaloneMode = "paper";
+              currentPaperItem = paperItem;
+              currentBasePaperItem = paperItem;
+              currentRawContextItem = paperItem;
+              paperTab.classList.add("active");
+              openTab.classList.remove("active");
+              syncPaperTabLabel();
+              mountChatPanel(portalItem, paperItem);
+              mounted = true;
+            } finally {
+              if (!mounted) targetModeSnapshot.restore();
+            }
+          } else {
+            const portalItem = buildStandalonePortalItem({
+              mode: "open",
+              conversationKey: entry.conversationKey,
+            });
+            if (!portalItem) return false;
+            const targetModeSnapshot = primeHistoryNavigationMode({
+              system: currentConversationSystem,
+              libraryID:
+                Number(entry.libraryID || 0) || getCurrentLibraryScopeID(),
+              mode: "global",
+              conversationKey: entry.conversationKey,
+            });
+            let mounted = false;
+            try {
+              standaloneMode = "open";
+              paperTab.classList.remove("active");
+              openTab.classList.add("active");
+              mountChatPanel(portalItem);
+              mounted = true;
+            } finally {
+              if (!mounted) targetModeSnapshot.restore();
+            }
+          }
+          return true;
+        } catch (err) {
+          appLogger.warn("LLM: standalone search navigate failed", err);
+          return false;
+        }
+      };
+
+      const searchPopupController = createHistorySearchPopupController({
+        parent: root,
+        loadEntries: loadAllStandaloneSearchEntries,
+        loadDocument: loadStandaloneSearchDocument,
+        onSelect: selectStandaloneSearchEntry,
+        onDelete: async (entry) => {
+          await queueStandaloneHistoryDeletion(
+            toStandaloneDeletionEntry(entry),
+          );
+        },
+        translate: t,
+        log: (...args) => appLogger.warn("LLM: standalone search popup", args),
+        resolveLabel: (entry) =>
+          isOrphanHistoryEntry(entry)
+            ? t("Orphan")
+            : entry.kind === "paper"
+              ? resolvePaperLabel(entry.paperItemID)
+              : t("Library chat"),
+        resolveScopeLabel: (entry) =>
+          entry.kind === "paper"
+            ? resolvePaperSearchScopeLabel(entry.paperItemID, entry.sourceState)
+            : t("Library chat"),
+      });
+
+      iconSearch.addEventListener("click", () => {
+        searchPopupController.toggle();
+      });
+
+      // ----------------------------------------------------------------
+      // Skills popup — open/close/render/interactions
+      // ----------------------------------------------------------------
+      let skillCtxFilePath = ""; // tracks which file the context menu targets
+      let skillCtxFilename = ""; // basename of ctx target
+      let skillCtxSource: "system" | "customized" | "personal" = "personal";
+
+      /** Reload the in-memory skill list from disk (call after create/delete). */
+      const reloadRuntimeSkills = async () => {
+        const { loadUserSkills } =
+          await import("../../agent/skills/userSkills");
+        const { setUserSkills } = await import("../../agent/skills");
+        const skills = await loadUserSkills();
+        setUserSkills(skills);
+      };
+
+      const reloadClaudeProjectCommands = async () => {
+        try {
+          await refreshClaudeSlashCommands(await initAgentSubsystem(), true);
+        } catch (err) {
+          appLogger.warn("LLM: Claude project command refresh failed", err);
+        }
+      };
+
+      const resolveSkillPopupSystem = (): "upstream" | "claude_code" =>
+        resolveConversationSystemForItem(activeItem) === "claude_code"
+          ? "claude_code"
+          : "upstream";
+
+      let skillRenderSeq = 0;
+      const renderSkillGrid = async () => {
+        const renderSeq = ++skillRenderSeq;
+        const skillSystem = resolveSkillPopupSystem();
+        const isClaudeMode = skillSystem === "claude_code";
+        try {
+          const entries: Array<{
+            filePath: string;
+            openPath?: string;
+            filename: string;
+            description: string;
+            source: "system" | "customized" | "personal";
+            managedBlockOutdated?: boolean;
+            shippedVersion?: number | null;
+            version?: number;
+            id?: string;
+          }> = isClaudeMode
+            ? (await listClaudeProjectSkillEntries()).map((entry) => ({
+                filePath: entry.filePath,
+                openPath: entry.openPath,
+                filename: `/${entry.name}`,
+                description: entry.description,
+                source: "personal" as const,
+              }))
+            : await (
+                await import("../../agent/skills/userSkills")
+              ).getSkillListing();
+          if (
+            renderSeq !== skillRenderSeq ||
+            skillSystem !== resolveSkillPopupSystem()
+          ) {
+            return;
+          }
+          skillGrid.textContent = "";
+
+          // "+" add button — first grid item
+          const addBtn = doc.createElementNS(
+            HTML_NS,
+            "button",
+          ) as HTMLButtonElement;
+          addBtn.className =
+            "llm-standalone-skill-item llm-standalone-skill-add";
+          addBtn.type = "button";
+          const addIcon = doc.createElementNS(
+            HTML_NS,
+            "span",
+          ) as HTMLSpanElement;
+          addIcon.className = "llm-standalone-skill-add-icon";
+          addIcon.textContent = "+";
+          const addLabel = doc.createElementNS(
+            HTML_NS,
+            "span",
+          ) as HTMLSpanElement;
+          addLabel.className = "llm-standalone-skill-label";
+          addLabel.textContent = t("New skill");
+          addBtn.append(addIcon, addLabel);
+          addBtn.addEventListener("click", async () => {
+            const filePath = isClaudeMode
+              ? await createClaudeProjectSkillTemplate()
+              : await (
+                  await import("../../agent/skills/userSkills")
+                ).createSkillTemplate();
+            if (filePath) {
+              try {
+                (
+                  Zotero as unknown as { launchFile?: (p: string) => void }
+                ).launchFile?.(filePath);
+              } catch {
+                /* */
+              }
+              if (isClaudeMode) {
+                await reloadClaudeProjectCommands();
+              } else {
+                await reloadRuntimeSkills();
+              }
+              void renderSkillGrid();
+            }
+          });
+          skillGrid.appendChild(addBtn);
+
+          // Skill file items
+          for (const entry of entries) {
+            const item = doc.createElementNS(
+              HTML_NS,
+              "button",
+            ) as HTMLButtonElement;
+            item.className = "llm-standalone-skill-item";
+            item.type = "button";
+            item.dataset.filePath = entry.filePath;
+            item.dataset.source = entry.source;
+
+            // Customized built-ins get an accent border; outdated-format gets
+            // a stronger amber cue so the user notices they should restore.
+            if (entry.source === "customized") {
+              item.style.borderColor = entry.managedBlockOutdated
+                ? "#d97706"
+                : "var(--color-accent, #2563eb)";
+            }
+
+            const icon = doc.createElementNS(
+              HTML_NS,
+              "span",
+            ) as HTMLSpanElement;
+            icon.className = "llm-standalone-skill-doc-icon";
+
+            const label = doc.createElementNS(
+              HTML_NS,
+              "span",
+            ) as HTMLSpanElement;
+            label.className = "llm-standalone-skill-label";
+            label.textContent = entry.filename;
+
+            item.append(icon, label);
+
+            // Tooltip summarizes source + available actions
+            const tooltipLines = [entry.description || entry.filename, ""];
+            if (entry.source === "system") {
+              tooltipLines.push(`Shipped built-in (v${entry.version ?? 0})`);
+            } else if (entry.source === "customized") {
+              const shippedVersion = entry.shippedVersion ?? null;
+              const version = entry.version ?? 0;
+              tooltipLines.push(
+                entry.managedBlockOutdated
+                  ? `Customized — shipped v${shippedVersion ?? "unknown"} uses a new format. Right-click → Restore to default to adopt it (overwrites your edits).`
+                  : typeof shippedVersion === "number" &&
+                      version < shippedVersion
+                    ? `Customized — shipped v${shippedVersion} available. Right-click → Restore to default to adopt it.`
+                    : `Customized built-in.`,
+              );
+            } else {
+              tooltipLines.push(`Your custom skill.`);
+            }
+            item.title = tooltipLines.filter(Boolean).join("\n");
+
+            // Left click — open in system editor
+            item.addEventListener("click", () => {
+              try {
+                (
+                  Zotero as unknown as { launchFile?: (p: string) => void }
+                ).launchFile?.(entry.openPath || entry.filePath);
+              } catch {
+                /* */
+              }
+            });
+
+            // Right click — context menu
+            item.addEventListener("contextmenu", (e: Event) => {
+              e.preventDefault();
+              e.stopPropagation();
+              const me = e as MouseEvent;
+              skillCtxFilePath = entry.filePath;
+              skillCtxFilename = entry.filename;
+              skillCtxSource = entry.source;
+              skillCtxMenu.style.display = "flex";
+
+              // Show Restore only for customized built-ins
+              skillCtxRestore.style.display =
+                entry.source === "customized" ? "flex" : "none";
+              // Hide Delete for system built-ins (they'd just be re-seeded)
+              skillCtxDelete.style.display =
+                entry.source === "system" ? "none" : "flex";
+
+              // Position with viewport bounds checking
+              const menuW = 200;
+              const menuH = 110;
+              let x = me.clientX + 4;
+              let y = me.clientY + 4;
+              if (x + menuW > (doc.documentElement?.clientWidth ?? 9999))
+                x = me.clientX - menuW;
+              if (y + menuH > (doc.documentElement?.clientHeight ?? 9999))
+                y = me.clientY - menuH;
+              skillCtxMenu.style.left = `${x}px`;
+              skillCtxMenu.style.top = `${y}px`;
+            });
+
+            skillGrid.appendChild(item);
+          }
+        } catch (err) {
+          if (renderSeq !== skillRenderSeq) return;
+          skillGrid.textContent = "";
+          const errorEl = doc.createElementNS(HTML_NS, "div") as HTMLDivElement;
+          errorEl.className = "llm-standalone-sidebar-empty";
+          errorEl.textContent = t("Failed to load skills");
+          skillGrid.appendChild(errorEl);
+          appLogger.warn(
+            `[llm-for-zotero] Standalone skill grid render failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+      };
+
+      const openSkillPopup = () => {
+        skillOverlay.style.display = "flex";
+        skillGrid.textContent = "";
+        const loading = doc.createElementNS(HTML_NS, "div") as HTMLDivElement;
+        loading.className = "llm-standalone-sidebar-empty";
+        loading.textContent = t("Loading…");
+        skillGrid.appendChild(loading);
+        if (resolveSkillPopupSystem() === "claude_code") {
+          void reloadClaudeProjectCommands();
+        } else {
+          void reloadRuntimeSkills();
+        }
+        void renderSkillGrid();
+      };
+
+      const closeSkillPopup = () => {
+        skillOverlay.style.display = "none";
+        skillCtxMenu.style.display = "none";
+      };
+
+      // Skill icon toggle
+      iconSkill.addEventListener("click", () => {
+        if (skillOverlay.style.display !== "none") {
+          closeSkillPopup();
+        } else {
+          openSkillPopup();
+        }
+      });
+
+      skillCloseBtn.addEventListener("click", () => closeSkillPopup());
+
+      skillOverlay.addEventListener("click", (e: Event) => {
+        if (e.target === skillOverlay) closeSkillPopup();
+      });
+
+      // Escape key — attached at document level so it works regardless of focus
+      doc.addEventListener("keydown", (e: Event) => {
+        if (skillOverlay.style.display === "none") return;
+        if ((e as KeyboardEvent).key === "Escape") {
+          e.preventDefault();
+          closeSkillPopup();
+        }
+      });
+
+      // Context menu: Show in file system
+      skillCtxShowInFs.addEventListener("click", async () => {
+        skillCtxMenu.style.display = "none";
+        const dir =
+          resolveSkillPopupSystem() === "claude_code"
+            ? getClaudeProjectDir()
+            : (
+                await import("../../agent/skills/userSkills")
+              ).getUserSkillsDir();
+        try {
+          (
+            Zotero as unknown as { launchFile?: (p: string) => void }
+          ).launchFile?.(dir);
+        } catch {
+          /* */
+        }
+      });
+
+      const refreshSkillPopupForCurrentSystem = async () => {
+        if (resolveSkillPopupSystem() === "claude_code") {
+          await reloadClaudeProjectCommands();
+        } else {
+          await reloadRuntimeSkills();
+        }
+        await renderSkillGrid();
+      };
+
+      // Context menu: Restore to default (customized built-ins only)
+      skillCtxRestore.addEventListener("click", async () => {
+        skillCtxMenu.style.display = "none";
+        if (!skillCtxFilename || skillCtxSource !== "customized") return;
+        const { restoreSkillToDefault } =
+          await import("../../agent/skills/userSkills");
+        const confirmed = await showStandaloneConfirmationDialog(doc, {
+          title: t("Restore skill to default?"),
+          message: `Restore ${skillCtxFilename} to the shipped default? Your customizations in this file will be lost.`,
+          confirmLabel: t("Restore"),
+          cancelLabel: t("Cancel"),
+          destructive: true,
+        });
+        if (!confirmed) return;
+        const ok = await restoreSkillToDefault(skillCtxFilename);
+        skillCtxFilePath = "";
+        skillCtxFilename = "";
+        if (ok) {
+          await refreshSkillPopupForCurrentSystem();
+        }
+      });
+
+      // Context menu: Delete (+ reload runtime skills)
+      skillCtxDelete.addEventListener("click", async () => {
+        skillCtxMenu.style.display = "none";
+        if (!skillCtxFilePath) return;
+        if (resolveSkillPopupSystem() === "claude_code") {
+          await deleteClaudeProjectSkillFile(skillCtxFilePath);
+          await reloadClaudeProjectCommands();
+        } else {
+          const { deleteSkillFile } =
+            await import("../../agent/skills/userSkills");
+          await deleteSkillFile(skillCtxFilePath);
+          await reloadRuntimeSkills();
+        }
+        skillCtxFilePath = "";
+        skillCtxFilename = "";
+        await refreshSkillPopupForCurrentSystem();
+      });
+
+      // Header: Check for updates — re-seed built-ins and refresh the grid
+      skillRefreshBtn.addEventListener("click", async () => {
+        skillRefreshBtn.disabled = true;
+        const originalText = skillRefreshBtn.textContent;
+        skillRefreshBtn.textContent = t("Checking…");
+        try {
+          if (resolveSkillPopupSystem() === "claude_code") {
+            await reloadClaudeProjectCommands();
+          } else {
+            const { initUserSkills } =
+              await import("../../agent/skills/userSkills");
+            await initUserSkills();
+            await reloadRuntimeSkills();
+          }
+          await renderSkillGrid();
+          skillRefreshBtn.textContent = t("Up to date");
+          doc.defaultView?.setTimeout(() => {
+            skillRefreshBtn.textContent = originalText;
+            skillRefreshBtn.disabled = false;
+          }, 1500);
+        } catch (err) {
+          appLogger.warn(
+            `[llm-for-zotero] Skill refresh failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          skillRefreshBtn.textContent = t("Update failed");
+          doc.defaultView?.setTimeout(() => {
+            skillRefreshBtn.textContent = originalText;
+            skillRefreshBtn.disabled = false;
+          }, 2000);
+        }
+      });
+
+      // Dismiss context menu on click outside
+      doc.addEventListener("mousedown", (e: Event) => {
+        const target = e.target as HTMLElement;
+        if (skillCtxMenu.style.display !== "none") {
+          if (!skillCtxMenu.contains(target)) {
+            skillCtxMenu.style.display = "none";
+          }
+        }
+      });
+
+      // Click-outside dismissal for export popup
+      doc.addEventListener("mousedown", (e: Event) => {
+        const target = e.target as HTMLElement;
+        if (exportPopup.style.display !== "none") {
+          if (!exportPopup.contains(target) && !iconExport.contains(target)) {
+            exportPopup.style.display = "none";
+          }
+        }
+      });
+
+      const hideStandaloneHistoryUndoToast = () => {
+        standaloneHistoryUndo.style.display = "none";
+        standaloneHistoryUndoText.textContent = "";
+      };
+
+      const showStandaloneHistoryUndoToast = () => {
+        standaloneHistoryUndoText.textContent = `Conversation deleted — Undo`;
+        standaloneHistoryUndo.style.display = "flex";
+      };
+
+      const renderStandalonePendingDeletionToast = () => {
+        // This window renders conversation undo only. A newer TURN deletion
+        // (queued from the item panel, which shares one store) must not blank
+        // out a conversation deletion that is still undoable here.
+        const latest =
+          pendingDeletionStore.getLatestPendingOfKind("conversation");
+        if (!latest || latest.expiresAt <= Date.now()) {
+          hideStandaloneHistoryUndoToast();
+          return;
+        }
+        showStandaloneHistoryUndoToast();
+      };
+
+      renderStandalonePendingDeletionToast();
+
+      const setStandaloneHistoryStatus = (
+        message: string,
+        level: "ready" | "warning" | "error",
+      ) => {
+        const statusEl = contentArea.querySelector(
+          "#llm-status",
+        ) as HTMLElement | null;
+        if (statusEl) setStatus(statusEl, message, level);
+      };
+
+      const getStandaloneRenameIdentity = (
+        entry: SidebarConv,
+      ): ConversationRenameIdentity => ({
+        system: entry.conversationSystem || currentConversationSystem,
+        kind: entry.kind || (entry.mode === "paper" ? "paper" : "global"),
+        conversationKey: Number(entry.conversationKey || 0),
+      });
+
+      const renameStandaloneHistoryEntry = async (
+        entry: SidebarConv,
+      ): Promise<void> => {
+        const target = getStandaloneRenameIdentity(entry);
+        const renameGeneration = getConversationWriteGeneration(
+          target.conversationKey,
+        );
+        if (
+          !isConversationRenameEligible({
+            identity: target,
+            pendingDelete: pendingDeletionStore.isConversationPendingDeletion(
+              target.conversationKey,
+            ),
+          })
+        ) {
+          return;
+        }
+        const currentTitle = normalizeHistoryTitle(entry.title || "");
+        const rawTitle = await showConversationRenameDialog(doc, {
+          title: t("Rename chat"),
+          initialTitle: currentTitle,
+          confirmLabel: t("Rename"),
+          cancelLabel: t("Cancel"),
+        });
+        if (rawTitle === null) return;
+        const title = normalizeConversationTitleSeed(rawTitle);
+        if (!title) {
+          setStandaloneHistoryStatus(t("Chat title cannot be empty"), "error");
+          return;
+        }
+        try {
+          let currentEntry = standaloneSidebarEntriesByKey.get(
+            target.conversationKey,
+          );
+          if (
+            !canCommitConversationRename({
+              target,
+              current: currentEntry
+                ? getStandaloneRenameIdentity(currentEntry)
+                : null,
+              pendingDelete: pendingDeletionStore.isConversationPendingDeletion(
+                target.conversationKey,
+              ),
+            })
+          ) {
+            return;
+          }
+          const summary = await conversationRepository.getCatalogEntry(target);
+          currentEntry = standaloneSidebarEntriesByKey.get(
+            target.conversationKey,
+          );
+          if (
+            !summary ||
+            summary.kind !== target.kind ||
+            !canCommitConversationRename({
+              target,
+              current: currentEntry
+                ? getStandaloneRenameIdentity(currentEntry)
+                : null,
+              pendingDelete: pendingDeletionStore.isConversationPendingDeletion(
+                target.conversationKey,
+              ),
+            })
+          ) {
+            return;
+          }
+          await conversationRepository.setCatalogTitle({
+            ...target,
+            expectedGeneration: renameGeneration,
+            title,
+          });
+          searchDocCache.delete(target.conversationKey);
+          if (cancelled) return;
+          await renderSidebar();
+          if (cancelled) return;
+          setStandaloneHistoryStatus(t("Conversation renamed"), "ready");
+        } catch (err) {
+          appLogger.warn("LLM: standalone rename conversation failed", err);
+          if (cancelled) return;
+          setStandaloneHistoryStatus(
+            t("Failed to rename conversation"),
+            "error",
+          );
+        }
+      };
+
+      const normalizeStandaloneCreateConversationOptions = (
+        options: boolean | StandaloneCreateConversationOptions | undefined,
+      ): Required<StandaloneCreateConversationOptions> => {
+        if (typeof options === "boolean") {
+          return { forceFresh: options, excludeConversationKey: 0 };
+        }
+        return {
+          forceFresh: Boolean(options?.forceFresh),
+          excludeConversationKey:
+            Number.isFinite(options?.excludeConversationKey) &&
+            Number(options?.excludeConversationKey) > 0
+              ? Math.floor(Number(options?.excludeConversationKey))
+              : 0,
+        };
+      };
+
+      // Conversations this window gave up because a deletion was queued, keyed
+      // by pending-deletion entry id, so an undone or abandoned deletion can
+      // put the user back instead of stranding them on a fresh blank chat.
+      const standaloneSurrenderedDeletions = new Map<string, SidebarConv>();
+      const enqueueStandaloneConversationDeletionEvent =
+        createSerializedConversationDeletionEventQueue();
+
+      const switchStandaloneToConversationEntry = async (
+        entry: SidebarConv,
+      ): Promise<boolean> => {
+        const key = Number(entry.conversationKey || 0);
+        if (!key) return false;
+        if (pendingDeletionStore.isConversationPendingDeletion(key)) {
+          setStandaloneHistoryStatus(
+            t("Deletion pending; retrying safely"),
+            "warning",
+          );
+          return false;
+        }
+        // Deliberate navigation: the user wants this key alive again, and this
+        // window has chosen where it sits — any remembered surrender is void so
+        // an abandoned deletion cannot yank it off the chat just opened.
+        forgetRecentlyDeletedConversation(key);
+        standaloneSurrenderedDeletions.clear();
+        const entryMode =
+          entry.mode || (entry.kind === "global" ? "open" : "paper");
+        standaloneMode = entryMode === "open" ? "open" : "paper";
+        paperTab.classList.toggle("active", standaloneMode === "paper");
+        openTab.classList.toggle("active", standaloneMode === "open");
+        activeConversationKey = key;
+        if (standaloneMode === "open") {
+          const currentLibraryID = Number(
+            entry.libraryID || getCurrentLibraryScopeID(),
+          );
+          if (isClaudeConversationSystem()) {
+            activeClaudeGlobalConversationByLibrary.set(
+              buildClaudeLibraryStateKey(currentLibraryID),
+              key,
+            );
+          } else if (isCodexConversationSystem()) {
+            activeCodexGlobalConversationByLibrary.set(
+              buildCodexLibraryStateKey(currentLibraryID),
+              key,
+            );
+            setLastUsedCodexGlobalConversationKey(currentLibraryID, key);
+          } else {
+            activeGlobalConversationByLibrary.set(currentLibraryID, key);
+            setLastUsedUpstreamGlobalConversationKey(currentLibraryID, key);
+          }
+          const newItem = buildStandalonePortalItem({
+            mode: "open",
+            conversationKey: key,
+          });
+          if (!newItem) return false;
+          mountChatPanel(newItem);
+          return true;
+        }
+        if (!currentBasePaperItem) return false;
+        const newItem = buildStandalonePortalItem({
+          mode: "paper",
+          conversationKey: key,
+          paperItem: currentBasePaperItem,
+          sessionVersion: entry.sessionVersion,
+        });
+        currentPaperItem = currentBasePaperItem;
+        if (!newItem) return false;
+        mountChatPanel(newItem);
+        return true;
+      };
+
+      openBatchPaperConversationInStandalone = async (summary, paper) => {
+        if (currentConversationSystem !== "codex")
+          await switchConversationSystem("codex");
+        currentBasePaperItem = paper;
+        currentRawContextItem = paper;
+        if (!(await switchStandaloneToConversationEntry(summary)))
+          throw new Error("无法打开指定论文会话");
+        await renderSidebar();
+      };
+      newWin.addEventListener(
+        "unload",
+        () => {
+          openBatchPaperConversationInStandalone = undefined;
+        },
+        { once: true },
+      );
+      const clearStandaloneActiveConversationForPendingDeletion = async (
+        entry: SidebarConv,
+      ): Promise<boolean> => {
+        const deletedConversationKey = Number(entry.conversationKey || 0);
+        return await clearActiveConversationForPendingDeletion(
+          entry.kind || (standaloneMode === "open" ? "global" : "paper"),
+          {
+            createFreshGlobalConversation: async () => {
+              const currentLibraryID = getCurrentLibraryScopeID();
+              const newKey = await resolveFreshStandaloneGlobalConversation({
+                forceFresh: true,
+                excludeConversationKey: deletedConversationKey,
+              });
+              if (!newKey || cancelled) return false;
+              return await switchStandaloneToConversationEntry({
+                conversationKey: newKey,
+                kind: "global",
+                conversationSystem: currentConversationSystem,
+                libraryID: currentLibraryID,
+                lastActivityAt: Date.now(),
+                mode: "open",
+              });
+            },
+            createFreshPaperConversation: async () => {
+              if (!currentBasePaperItem) {
+                return await restoreStandaloneOpenConversation(false);
+              }
+              const paperId = Number(currentBasePaperItem.id || 0);
+              const paperLibraryID = getCurrentPaperLibraryID();
+              const summary = await resolveStandalonePaperConversation({
+                forceFresh: true,
+                excludeConversationKey: deletedConversationKey,
+              });
+              const newKey = Number(summary.conversationKey || 0);
+              if (!newKey || cancelled) return false;
+              return await switchStandaloneToConversationEntry({
+                conversationKey: newKey,
+                kind: "paper",
+                conversationSystem: currentConversationSystem,
+                libraryID: paperLibraryID,
+                lastActivityAt: Date.now(),
+                paperItemID: paperId,
+                sessionVersion: summary.sessionVersion,
+                mode: "paper",
+              });
+            },
+            log: (message, ...args) => appLogger.warn(message, ...args),
+          },
+        );
+      };
+
+      const toStandaloneDeletionSurfaceEntry = (
+        entry: PendingConversationDeletionEntry,
+      ): SidebarConv => ({
+        conversationID: entry.conversationID,
+        conversationKey: entry.conversationKey,
+        kind: entry.conversationKind,
+        conversationSystem: entry.system,
+        libraryID: entry.libraryID,
+        lastActivityAt: 0,
+        title: entry.title,
+        paperItemID: entry.paperItemID,
+        providerSessionId: entry.providerSessionId,
+        mode: entry.conversationKind === "paper" ? "paper" : "open",
+      });
+
+      const handleStandaloneConversationDeletionEvent = async (
+        event: PendingDeletionEvent,
+      ): Promise<void> => {
+        if (event.entry.kind !== "conversation") return;
+        const entry = event.entry;
+        // The store drops the entry before it notifies, so this tombstone is
+        // the only thing keeping renderSidebar from re-seeding the dead key.
+        // Only a REAL deletion tombstones the key; a dropped intent leaves the
+        // conversation alive and it must stay seedable.
+        if (
+          (event.type === "completed" || event.type === "finalized") &&
+          !event.dropped &&
+          entry.instanceID
+        ) {
+          markConversationInstanceRecentlyDeleted(
+            entry.conversationKey,
+            entry.instanceID,
+            Date.now(),
+            entry.identityDigest,
+          );
+        }
+        const registered =
+          activeConversationKey > 0
+            ? await getRegisteredConversationScope(activeConversationKey)
+            : null;
+        const action = resolveConversationDeletionSurfaceAction({
+          eventType: event.type,
+          entry,
+          surface:
+            activeConversationKey > 0
+              ? {
+                  conversationKey: activeConversationKey,
+                  instanceID: registered?.instanceID || undefined,
+                  kind: standaloneMode === "open" ? "global" : "paper",
+                  system: currentConversationSystem,
+                }
+              : null,
+          surrendered: standaloneSurrenderedDeletions.has(entry.id),
+          dropped: Boolean(event.dropped),
+        });
+        if (action.type === "leave") {
+          const surfaceEntry = toStandaloneDeletionSurfaceEntry(entry);
+          const left =
+            await clearStandaloneActiveConversationForPendingDeletion(
+              surfaceEntry,
+            );
+          if (left && action.remember) {
+            standaloneSurrenderedDeletions.set(entry.id, surfaceEntry);
+          } else if (!action.remember) {
+            // Nothing to come back to; drop the memory rather than leaking it.
+            standaloneSurrenderedDeletions.delete(entry.id);
+          }
+          if (!left) {
+            setStandaloneHistoryStatus(
+              t("Cannot delete active conversation right now"),
+              "error",
+            );
+          }
+        } else if (action.type === "restore") {
+          const target =
+            standaloneSurrenderedDeletions.get(entry.id) ||
+            toStandaloneDeletionSurfaceEntry(entry);
+          standaloneSurrenderedDeletions.delete(entry.id);
+          await switchStandaloneToConversationEntry(target);
+        } else if (action.type === "forget") {
+          standaloneSurrenderedDeletions.delete(entry.id);
+        }
+        if (cancelled || newWin.closed) return;
+        scheduleStandaloneSidebarRender();
+      };
+
+      unsubscribeStandalonePendingDeletions?.();
+      unsubscribeStandalonePendingDeletions = pendingDeletionStore.subscribe(
+        (event) => {
+          if (cancelled || newWin.closed) return;
+          renderStandalonePendingDeletionToast();
+          if (event.entry.kind === "conversation") {
+            void enqueueStandaloneConversationDeletionEvent(() =>
+              handleStandaloneConversationDeletionEvent(event),
+            );
+            return;
+          }
+          scheduleStandaloneSidebarRender();
+        },
+      );
+
+      standaloneHistoryUndoBtn.addEventListener("click", () => {
+        // Must match renderStandalonePendingDeletionToast: this button is
+        // labelled with a conversation title, so it may only undo that entry.
+        const latest =
+          pendingDeletionStore.getLatestPendingOfKind("conversation");
+        if (!latest) return;
+        void pendingDeletionStore.undo(latest.id).then((undone) => {
+          if (undone) {
+            setStandaloneHistoryStatus(t("Conversation restored"), "ready");
+            return;
+          }
+          setStandaloneHistoryStatus(
+            t("Failed to restore. Check logs."),
+            "error",
+          );
+        });
+      });
+
+      const toStandaloneDeletionEntry = (
+        entry: ConversationHistoryEntry,
+      ): SidebarConv => ({
+        conversationID: entry.conversationID,
+        conversationKey: entry.conversationKey,
+        kind: entry.kind,
+        conversationSystem: currentConversationSystem,
+        libraryID: entry.libraryID || getCurrentLibraryScopeID(),
+        lastActivityAt: entry.lastActivityAt,
+        title: entry.title,
+        userTurnCount: entry.userTurnCount,
+        sessionVersion: entry.sessionVersion,
+        paperItemID: entry.paperItemID,
+        providerSessionId: entry.providerSessionId,
+        scopedConversationKey: entry.scopedConversationKey,
+        mode: entry.kind === "paper" ? "paper" : "open",
+      });
+
+      const hydrateStandaloneHistoryDeletionEntry = async (
+        entry: SidebarConv,
+      ): Promise<SidebarConv> => {
+        const conversationKey = Number(entry.conversationKey || 0);
+        const kind =
+          entry.kind || (entry.mode === "paper" ? "paper" : "global");
+        const conversationSystem =
+          entry.conversationSystem || currentConversationSystem;
+        if (!conversationKey) {
+          return { ...entry, kind, conversationSystem };
+        }
+        try {
+          const summary = await conversationRepository.getCatalogEntry({
+            system: conversationSystem,
+            kind,
+            conversationKey,
+          });
+          if (!summary || summary.kind !== kind) {
+            return {
+              ...entry,
+              kind,
+              conversationSystem,
+              libraryID: entry.libraryID || getCurrentLibraryScopeID(),
+            };
+          }
+          return toSidebarConversation(summary);
+        } catch (err) {
+          appLogger.warn(
+            "LLM: Failed to hydrate standalone history row before deletion",
+            { conversationKey, error: err },
+          );
+          return {
+            ...entry,
+            kind,
+            conversationSystem,
+            libraryID: entry.libraryID || getCurrentLibraryScopeID(),
+          };
+        }
+      };
+
+      const queueStandaloneHistoryDeletion = async (rawEntry: SidebarConv) => {
+        const entry = await hydrateStandaloneHistoryDeletionEntry(rawEntry);
+        const key = Number(entry.conversationKey || 0);
+        if (!key) return;
+        const isActive = key === activeConversationKey;
+        if (pendingDeletionStore.isConversationPendingDeletion(key)) {
+          return;
+        }
+
+        const deletionConversationSystem =
+          entry.conversationSystem || currentConversationSystem;
+        try {
+          const conversationKind =
+            (entry.kind || (standaloneMode === "open" ? "global" : "paper")) ===
+            "paper"
+              ? ("paper" as const)
+              : ("global" as const);
+          // Persist the write-ahead intent before moving an active window.
+          // The queued event performs the move after the row is durable, so a
+          // crash cannot strand the user in a new chat without an obligation.
+          // Same identity witness the panel path captures: without it the
+          // durable intent is retained and later moved to identity quarantine.
+          const identityWitness =
+            await conversationRepository.getCatalogIdentityWitness({
+              system: deletionConversationSystem,
+              kind: conversationKind,
+              conversationKey: key,
+            });
+          const queued = await pendingDeletionStore.queueConversationDeletion({
+            conversationKind,
+            instanceID: identityWitness?.instanceID || "",
+            conversationID:
+              identityWitness?.conversationID || entry.conversationID,
+            catalogCreatedAt: identityWitness?.catalogCreatedAt || 0,
+            conversationKey: key,
+            libraryID:
+              Number(entry.libraryID || 0) ||
+              (entry.kind === "paper"
+                ? getCurrentPaperLibraryID()
+                : getCurrentLibraryScopeID()),
+            system: deletionConversationSystem,
+            paperItemID: entry.paperItemID,
+            providerSessionId: entry.providerSessionId || undefined,
+            title: entry.title || "",
+            wasActive: isActive,
+          });
+          if (!queued) {
+            setStandaloneHistoryStatus(
+              t("Failed to queue deletion. Check logs."),
+              "error",
+            );
+            return;
+          }
+          if (isActive) {
+            // We already stepped off this chat above; remember where we came
+            // from so an undo or an abandoned deletion can put the user back.
+            standaloneSurrenderedDeletions.set(queued.id, entry);
+          }
+          await renderSidebar();
+          setStandaloneHistoryStatus(
+            t("Conversation deleted. Undo available."),
+            "ready",
+          );
+        } catch (err) {
+          appLogger.warn("LLM: standalone delete conversation failed", err);
+          if (isActive) {
+            await switchStandaloneToConversationEntry(entry).catch(() => {});
+          }
+          await renderSidebar().catch(() => {});
+        }
+      };
+
+      // Sidebar click handler — rename or delete conversation
+      sidebarList.addEventListener("click", async (e: Event) => {
+        const renameTarget = (e.target as HTMLElement).closest(
+          ".llm-standalone-conv-rename",
+        ) as HTMLElement | null;
+        if (renameTarget) {
+          e.preventDefault();
+          e.stopPropagation();
+          const row = renameTarget.closest(
+            ".llm-standalone-conv-item",
+          ) as HTMLElement | null;
+          if (!row) return;
+          const key = Number(row.dataset.conversationKey);
+          if (!key) return;
+          const entry = standaloneSidebarEntriesByKey.get(key);
+          if (!entry) return;
+          await renameStandaloneHistoryEntry(entry);
+          return;
+        }
+
+        const deleteTarget = (e.target as HTMLElement).closest(
+          ".llm-standalone-conv-delete",
+        ) as HTMLElement | null;
+        if (deleteTarget) {
+          e.preventDefault();
+          e.stopPropagation();
+          const row = deleteTarget.closest(
+            ".llm-standalone-conv-item",
+          ) as HTMLElement | null;
+          if (!row) return;
+          const key = Number(row.dataset.conversationKey);
+          if (!key) return;
+          const entry = standaloneSidebarEntriesByKey.get(key);
+          if (!entry) return;
+          await queueStandaloneHistoryDeletion({
+            ...entry,
+            conversationKey: key,
+            lastActivityAt: entry.lastActivityAt,
+          });
+          return;
+        }
+      });
+
+      // Sidebar click handler — switch conversation
+      sidebarList.addEventListener("click", (e: Event) => {
+        const target = (e.target as HTMLElement).closest(
+          ".llm-standalone-conv-item",
+        ) as HTMLElement | null;
+        if (!target) return;
+        // Ignore row actions handled above.
+        if (
+          (e.target as HTMLElement).closest(
+            ".llm-standalone-conv-rename, .llm-standalone-conv-delete",
+          )
+        )
+          return;
+        const key = Number(target.dataset.conversationKey);
+        if (!key || key === activeConversationKey) return;
+
+        activeConversationKey = key;
+
+        // Update active class
+        const conversationItems = Array.from(
+          sidebarList.querySelectorAll(".llm-standalone-conv-item"),
+        ) as HTMLElement[];
+        for (const el of conversationItems) {
+          el.classList.remove("active");
+        }
+        target.classList.add("active");
+
+        if (standaloneMode === "open") {
+          const currentLibraryID = getCurrentLibraryScopeID();
+          if (isClaudeConversationSystem()) {
+            activeClaudeGlobalConversationByLibrary.set(
+              buildClaudeLibraryStateKey(currentLibraryID),
+              key,
+            );
+          } else if (isCodexConversationSystem()) {
+            activeCodexGlobalConversationByLibrary.set(
+              buildCodexLibraryStateKey(currentLibraryID),
+              key,
+            );
+            setLastUsedCodexGlobalConversationKey(currentLibraryID, key);
+          } else {
+            activeGlobalConversationByLibrary.set(currentLibraryID, key);
+            setLastUsedUpstreamGlobalConversationKey(currentLibraryID, key);
+          }
+          const newItem = buildStandalonePortalItem({
+            mode: "open",
+            conversationKey: key,
+          });
+          if (newItem) mountChatPanel(newItem);
+        } else {
+          if (currentBasePaperItem) {
+            const sessionVersion = Number(target.dataset.sessionVersion || "0");
+            const newItem = buildStandalonePortalItem({
+              mode: "paper",
+              conversationKey: key,
+              paperItem: currentBasePaperItem,
+              sessionVersion,
+            });
+            currentPaperItem = currentBasePaperItem;
+            if (newItem) mountChatPanel(newItem);
+          }
+        }
+      });
+
+      sidebarList.addEventListener("keydown", (e: Event) => {
+        const event = e as KeyboardEvent;
+        if (event.key !== "Enter" && event.key !== " ") return;
+        const target = event.target as HTMLElement;
+        const row = target.closest(
+          ".llm-standalone-conv-item",
+        ) as HTMLElement | null;
+        if (!row || target !== row) return;
+        event.preventDefault();
+        row.click();
+      });
+
+      /**
+       * The conversation on screen may belong to the runtime the window is
+       * leaving: `currentConversationSystem` flips before the key moves. Only a
+       * key from the entered runtime's own key space may be offered as that
+       * runtime's current draft, or the window would mount the new runtime on
+       * the old runtime's conversation and its declared scope would stop
+       * describing what it is showing.
+       */
+      const currentDraftCandidateForSystem = (
+        kind: "global" | "paper",
+      ): number => {
+        const key = Math.floor(Number(activeConversationKey || 0));
+        if (!Number.isFinite(key) || key <= 0) return 0;
+        return isConversationKeyForKind(currentConversationSystem, kind, key)
+          ? key
+          : 0;
+      };
+
+      const resolveFreshStandaloneGlobalConversation = async (
+        options: boolean | StandaloneCreateConversationOptions = false,
+      ): Promise<number> => {
+        const { excludeConversationKey } =
+          normalizeStandaloneCreateConversationOptions(options);
+        const currentLibraryID = getCurrentLibraryScopeID();
+        if (!currentLibraryID) return 0;
+        const result = await resolveFreshConversationDraft({
+          system: currentConversationSystem,
+          kind: "global",
+          libraryID: currentLibraryID,
+          currentConversationKey: currentDraftCandidateForSystem("global"),
+          excludeConversationKey,
+        });
+        return result.conversationKey;
+      };
+
+      const resolveStandalonePaperConversation = async (
+        options: boolean | StandaloneCreateConversationOptions = false,
+        paperItemOverride?: Zotero.Item | null,
+      ): Promise<{ conversationKey: number; sessionVersion?: number }> => {
+        const { excludeConversationKey } =
+          normalizeStandaloneCreateConversationOptions(options);
+        const targetPaperItem = paperItemOverride || currentBasePaperItem;
+        if (!targetPaperItem) {
+          return { conversationKey: 0 };
+        }
+        const paperLibraryID = getLibraryIDForPaperItem(targetPaperItem);
+        const paperId = Number(targetPaperItem.id || 0);
+        if (!paperLibraryID || !paperId) {
+          return { conversationKey: 0 };
+        }
+        const result = await resolveFreshConversationDraft({
+          system: currentConversationSystem,
+          kind: "paper",
+          libraryID: paperLibraryID,
+          paperItemID: paperId,
+          currentConversationKey: currentDraftCandidateForSystem("paper"),
+          excludeConversationKey,
+        });
+        return {
+          conversationKey: result.conversationKey,
+          sessionVersion: result.sessionVersion,
+        };
+      };
+
+      const touchStandaloneEmptyDraftActivity = async (
+        conversationKey: number,
+        kind: "global" | "paper",
+      ): Promise<void> => {
+        const normalizedKey = Number.isFinite(conversationKey)
+          ? Math.floor(conversationKey)
+          : 0;
+        if (normalizedKey <= 0) return;
+        await conversationRepository.touchEmptyCatalogActivity({
+          system: currentConversationSystem,
+          kind,
+          conversationKey: normalizedKey,
+          timestamp: Date.now(),
+        });
+      };
+
+      const mountStandaloneOpenConversation = (
+        conversationKey: number,
+      ): boolean => {
+        const normalizedKey = Number.isFinite(conversationKey)
+          ? Math.floor(conversationKey)
+          : 0;
+        if (normalizedKey <= 0 || cancelled) return false;
+        standaloneMode = "open";
+        paperTab.classList.remove("active");
+        openTab.classList.add("active");
+        activeConversationKey = normalizedKey;
+        const currentLibraryID = getCurrentLibraryScopeID();
+        if (isClaudeConversationSystem()) {
+          activeClaudeGlobalConversationByLibrary.set(
+            buildClaudeLibraryStateKey(currentLibraryID),
+            normalizedKey,
+          );
+        } else if (isCodexConversationSystem()) {
+          activeCodexGlobalConversationByLibrary.set(
+            buildCodexLibraryStateKey(currentLibraryID),
+            normalizedKey,
+          );
+          setLastUsedCodexGlobalConversationKey(
+            currentLibraryID,
+            normalizedKey,
+          );
+        } else {
+          activeGlobalConversationByLibrary.set(
+            currentLibraryID,
+            normalizedKey,
+          );
+          setLastUsedUpstreamGlobalConversationKey(
+            currentLibraryID,
+            normalizedKey,
+          );
+        }
+        const nextItem = buildStandalonePortalItem({
+          mode: "open",
+          conversationKey: normalizedKey,
+        });
+        if (!nextItem) {
+          return false;
+        }
+        mountChatPanel(nextItem);
+        scheduleStandaloneSidebarRender();
+        return true;
+      };
+
+      const createStandaloneOpenConversationForContext =
+        async (): Promise<boolean> => {
+          const currentLibraryID = getCurrentLibraryScopeID();
+          if (!currentLibraryID) return false;
+          const summary = await conversationRepository.createCatalogEntry({
+            system: currentConversationSystem,
+            kind: "global",
+            libraryID: currentLibraryID,
+          });
+          const conversationKey = Number(summary?.conversationKey || 0);
+          if (!Number.isFinite(conversationKey) || conversationKey <= 0) {
+            return false;
+          }
+          if (cancelled) return false;
+          await touchStandaloneEmptyDraftActivity(conversationKey, "global");
+          return mountStandaloneOpenConversation(conversationKey);
+        };
+
+      const restoreStandaloneOpenConversation = async (
+        options: boolean | StandaloneCreateConversationOptions = false,
+      ): Promise<boolean> => {
+        const normalizedOptions =
+          normalizeStandaloneCreateConversationOptions(options);
+        const rememberedItem =
+          !normalizedOptions.forceFresh &&
+          !normalizedOptions.excludeConversationKey
+            ? resolveRememberedGlobalPanelItem(
+                getCurrentLibraryScopeID(),
+                currentConversationSystem,
+              )
+            : null;
+        const conversationKey = rememberedItem
+          ? getConversationKey(rememberedItem)
+          : await resolveFreshStandaloneGlobalConversation(normalizedOptions);
+        if (!conversationKey || cancelled) {
+          return false;
+        }
+        return mountStandaloneOpenConversation(conversationKey);
+      };
+
+      // Icon strip handlers — new chat
+      iconNewChat.addEventListener("click", async () => {
+        if (explicitNewChatInFlight) return;
+        explicitNewChatInFlight = true;
+        try {
+          // [webchat] In webchat mode, delegate to embedded panel's "+" button.
+          // Don't clear sidebar — webchat history stays (conversations live on the web).
+          if (isInWebChatMode) {
+            const embeddedNewBtn = contentArea.querySelector(
+              "#llm-history-new",
+            ) as HTMLElement | null;
+            if (embeddedNewBtn) embeddedNewBtn.click();
+            return;
+          }
+
+          if (standaloneMode === "open") {
+            const currentLibraryID = getCurrentLibraryScopeID();
+            const newKey = await resolveFreshStandaloneGlobalConversation(true);
+            if (!newKey || cancelled) return;
+            await touchStandaloneEmptyDraftActivity(newKey, "global");
+            activeConversationKey = newKey;
+            if (isClaudeConversationSystem()) {
+              activeClaudeGlobalConversationByLibrary.set(
+                buildClaudeLibraryStateKey(currentLibraryID),
+                newKey,
+              );
+            } else if (isCodexConversationSystem()) {
+              activeCodexGlobalConversationByLibrary.set(
+                buildCodexLibraryStateKey(currentLibraryID),
+                newKey,
+              );
+              setLastUsedCodexGlobalConversationKey(currentLibraryID, newKey);
+            } else {
+              activeGlobalConversationByLibrary.set(currentLibraryID, newKey);
+              setLastUsedUpstreamGlobalConversationKey(
+                currentLibraryID,
+                newKey,
+              );
+            }
+            const newItem = buildStandalonePortalItem({
+              mode: "open",
+              conversationKey: newKey,
+            });
+            if (!newItem) return;
+            mountChatPanel(newItem);
+            await renderSidebar();
+          } else {
+            if (currentBasePaperItem) {
+              const { conversationKey: newKey, sessionVersion } =
+                await resolveStandalonePaperConversation(true);
+              if (!newKey || cancelled) return;
+              await touchStandaloneEmptyDraftActivity(newKey, "paper");
+              const newItem = buildStandalonePortalItem({
+                mode: "paper",
+                conversationKey: newKey,
+                paperItem: currentBasePaperItem,
+                sessionVersion,
+              });
+              if (!newItem) return;
+              activeConversationKey = newKey;
+              currentPaperItem = currentBasePaperItem;
+              mountChatPanel(newItem);
+              await renderSidebar();
+            }
+          }
+        } catch (err) {
+          appLogger.warn("LLM: standalone new chat failed", err);
+        } finally {
+          explicitNewChatInFlight = false;
+        }
+      });
+
+      iconSidebarToggle.addEventListener("click", () => toggleSidebar());
+
+      // Standalone navigation and content-title actions
+      iconSettings.addEventListener("click", () => {
+        const btn = contentArea.querySelector(
+          "#llm-settings",
+        ) as HTMLElement | null;
+        if (btn) btn.click();
+      });
+      iconExport.addEventListener("click", (e: Event) => {
+        e.stopPropagation();
+        if (exportPopup.style.display !== "none") {
+          exportPopup.style.display = "none";
+          return;
+        }
+        const iconRect = iconExport.getBoundingClientRect();
+        exportPopup.style.position = "fixed";
+        exportPopup.style.left = "auto";
+        exportPopup.style.right = `${Math.max(
+          8,
+          Math.round(newWin.innerWidth - iconRect.right),
+        )}px`;
+        exportPopup.style.top = `${Math.round(iconRect.bottom + 4)}px`;
+        exportPopup.style.display = "flex";
+      });
+      exportPopupCopyBtn.addEventListener("click", () => {
+        exportPopup.style.display = "none";
+        const innerBtn = contentArea.querySelector(
+          "#llm-export-copy",
+        ) as HTMLElement | null;
+        if (innerBtn) innerBtn.click();
+      });
+      exportPopupNoteBtn.addEventListener("click", () => {
+        exportPopup.style.display = "none";
+        const innerBtn = contentArea.querySelector(
+          "#llm-export-note",
+        ) as HTMLElement | null;
+        if (innerBtn) innerBtn.click();
+      });
+      iconClear.addEventListener("click", () => {
+        const btn = contentArea.querySelector(
+          "#llm-clear",
+        ) as HTMLElement | null;
+        if (btn) btn.click();
+      });
+
+      // -----------------------------------------------------------------------
+      // Top bar tab switching
+      // -----------------------------------------------------------------------
+      let systemSwitchSeq = 0;
+      const switchConversationSystem = async (
+        nextSystem: ConversationSystem,
+        options?: { forceFresh?: boolean },
+      ) => {
+        const switchSeq = ++systemSwitchSeq;
+        // WebChat is an upstream-only provider mode. Leaving it here restores
+        // a non-webchat model entry before the runtime changes, so the
+        // remounted panel (and a later return to upstream) cannot silently
+        // re-enter webchat; the remount replaces the conversation itself.
+        if (isInWebChatMode) {
+          await currentChatHooks?.leaveWebChatMode?.();
+          if (switchSeq !== systemSwitchSeq || cancelled || newWin.closed)
+            return;
+        }
+        const activeNoteSession = resolveActiveNoteSession(activeItem);
+        const activeNoteItem = activeNoteSession ? activeItem : null;
+        if (activeNoteSession && activeNoteItem) {
+          const resolvedNextSystem = resolveNoteFocusSystemSwitch({
+            nextSystem,
+            codexAvailable: isCodexAppServerModeEnabled(),
+            claudeAvailable: getClaudeCodeModeEnabled(),
+          });
+          if (!resolvedNextSystem) return;
+          if (resolvedNextSystem === currentConversationSystem) return;
+          setConversationSystemPref(resolvedNextSystem);
+          currentConversationSystem = resolvedNextSystem;
+          if (options?.forceFresh === true) {
+            if (activeNoteSession.conversationKind === "global") {
+              const newKey =
+                await resolveFreshStandaloneGlobalConversation(true);
+              if (switchSeq !== systemSwitchSeq || !newKey) return;
+              await touchStandaloneEmptyDraftActivity(newKey, "global");
+              if (switchSeq !== systemSwitchSeq) return;
+              const libraryID = activeNoteSession.libraryID;
+              if (resolvedNextSystem === "claude_code") {
+                activeClaudeGlobalConversationByLibrary.set(
+                  buildClaudeLibraryStateKey(libraryID),
+                  newKey,
+                );
+              } else if (resolvedNextSystem === "codex") {
+                activeCodexGlobalConversationByLibrary.set(
+                  buildCodexLibraryStateKey(libraryID),
+                  newKey,
+                );
+                setLastUsedCodexGlobalConversationKey(libraryID, newKey);
+              } else {
+                activeGlobalConversationByLibrary.set(libraryID, newKey);
+                setLastUsedUpstreamGlobalConversationKey(libraryID, newKey);
+              }
+              activeConversationKey = newKey;
+            } else {
+              const paperItem =
+                currentBasePaperItem ||
+                resolveConversationBaseItem(activeNoteItem);
+              const { conversationKey: newKey } =
+                await resolveStandalonePaperConversation(true, paperItem);
+              if (switchSeq !== systemSwitchSeq || !newKey || !paperItem)
+                return;
+              await touchStandaloneEmptyDraftActivity(newKey, "paper");
+              if (switchSeq !== systemSwitchSeq) return;
+              const libraryID = getLibraryIDForPaperItem(paperItem);
+              const paperItemID = Number(paperItem.id || 0);
+              if (resolvedNextSystem === "claude_code") {
+                activeClaudePaperConversationByPaper.set(
+                  buildClaudePaperStateKey(libraryID, paperItemID),
+                  newKey,
+                );
+              } else if (resolvedNextSystem === "codex") {
+                activeCodexPaperConversationByPaper.set(
+                  buildCodexPaperStateKey(libraryID, paperItemID),
+                  newKey,
+                );
+                setLastUsedCodexPaperConversationKey(
+                  libraryID,
+                  paperItemID,
+                  newKey,
+                );
+              } else {
+                activePaperConversationByPaper.set(
+                  buildPaperStateKey(libraryID, paperItemID),
+                  newKey,
+                );
+              }
+              activeConversationKey = newKey;
+            }
+          }
+          if (switchSeq !== systemSwitchSeq || cancelled || newWin.closed)
+            return;
+          activeConversationKey = getConversationKey(activeNoteItem);
+          mountChatPanel(activeNoteItem);
+          scheduleStandaloneSidebarRender();
+          updateStandaloneSystemToggles();
+          return;
+        }
+        const currentSystem = currentConversationSystem;
+        if (nextSystem === currentSystem) return;
+        const forceFresh = options?.forceFresh === true;
+        setConversationSystemPref(nextSystem);
+        currentConversationSystem = nextSystem;
+        updateStandaloneSystemToggles();
+        if (standaloneMode === "open") {
+          const libraryID = getCurrentLibraryScopeID();
+          const mountOpenConversation = (conversationKey: number) => {
+            if (switchSeq !== systemSwitchSeq) return;
+            const nextItem =
+              nextSystem === "claude_code"
+                ? createClaudeGlobalPortalItem(libraryID, conversationKey)
+                : nextSystem === "codex"
+                  ? createCodexGlobalPortalItem(libraryID, conversationKey)
+                  : createGlobalPortalItem(libraryID, conversationKey);
+            activeConversationKey = conversationKey;
+            if (nextSystem === "claude_code") {
+              activeClaudeGlobalConversationByLibrary.set(
+                buildClaudeLibraryStateKey(libraryID),
+                conversationKey,
+              );
+            } else if (nextSystem === "codex") {
+              activeCodexGlobalConversationByLibrary.set(
+                buildCodexLibraryStateKey(libraryID),
+                conversationKey,
+              );
+              setLastUsedCodexGlobalConversationKey(libraryID, conversationKey);
+            } else {
+              activeGlobalConversationByLibrary.set(libraryID, conversationKey);
+              setLastUsedUpstreamGlobalConversationKey(
+                libraryID,
+                conversationKey,
+              );
+            }
+            mountChatPanel(nextItem as Zotero.Item);
+            scheduleStandaloneSidebarRender();
+            updateStandaloneSystemToggles();
+          };
+
+          if (forceFresh) {
+            const newKey = await resolveFreshStandaloneGlobalConversation(true);
+            if (switchSeq !== systemSwitchSeq) return;
+            if (newKey > 0) {
+              await touchStandaloneEmptyDraftActivity(newKey, "global");
+              if (switchSeq !== systemSwitchSeq) return;
+              mountOpenConversation(newKey);
+            }
+            return;
+          }
+
+          const rememberedItem = resolveRememberedGlobalPanelItem(
+            libraryID,
+            nextSystem,
+          );
+          const targetKey = rememberedItem
+            ? getConversationKey(rememberedItem)
+            : 0;
+          if (switchSeq !== systemSwitchSeq) return;
+          if (targetKey > 0) {
+            mountOpenConversation(targetKey);
+          }
+          return;
+        }
+        const nextRawItem =
+          getSelectedZoteroItem() || currentBasePaperItem || currentPaperItem;
+        const resolved = resolveInitialPanelItemState(nextRawItem, {
+          conversationSystem: nextSystem,
+          conversationMode: "paper",
+        });
+        currentRawContextItem = nextRawItem || currentRawContextItem;
+        currentBasePaperItem = resolved.basePaperItem || currentBasePaperItem;
+        currentPaperItem = resolved.item || currentPaperItem;
+        if (forceFresh) {
+          const paperItem = currentBasePaperItem;
+          if (!paperItem) return;
+          const { conversationKey: newKey, sessionVersion } =
+            await resolveStandalonePaperConversation(true);
+          if (switchSeq !== systemSwitchSeq) return;
+          if (!newKey) return;
+          await touchStandaloneEmptyDraftActivity(newKey, "paper");
+          if (switchSeq !== systemSwitchSeq) return;
+          const freshItem =
+            nextSystem === "claude_code"
+              ? createClaudePaperPortalItem(paperItem, newKey)
+              : nextSystem === "codex"
+                ? createCodexPaperPortalItem(paperItem, newKey)
+                : createPaperPortalItem(paperItem, newKey, sessionVersion || 1);
+          activeConversationKey = newKey;
+          currentPaperItem = paperItem;
+          mountChatPanel(freshItem as Zotero.Item, currentRawContextItem);
+          scheduleStandaloneSidebarRender();
+          void renderShortcuts(contentArea, freshItem as Zotero.Item, "paper");
+          updateStandaloneSystemToggles();
+          return;
+        }
+        if (switchSeq !== systemSwitchSeq) return;
+        const nextItem = resolved.item || nextRawItem;
+        if (nextItem) {
+          mountChatPanel(nextItem, currentRawContextItem);
+          scheduleStandaloneSidebarRender();
+          void renderShortcuts(
+            contentArea,
+            nextItem,
+            resolveShortcutMode(nextItem),
+          );
+        }
+        updateStandaloneSystemToggles();
+      };
+
+      for (const system of RUNTIME_CONVERSATION_SYSTEMS) {
+        standaloneRuntimeSystemControls.buttons[system].addEventListener(
+          "click",
+          (event) => {
+            event.preventDefault();
+            // A rebuilt standalone shell must never let duplicate listeners
+            // turn one physical click into two runtime toggles.
+            event.stopImmediatePropagation();
+            if (cancelled || newWin.closed) return;
+            void switchConversationSystem(
+              resolveRuntimeSystemToggleTarget(
+                currentConversationSystem,
+                system,
+              ),
+              { forceFresh: true },
+            );
+          },
+        );
+      }
+      updateStandaloneSystemToggles();
+      {
+        const claudeModePrefKey = `${config.prefsPrefix}.enableClaudeCodeMode`;
+        const codexModePrefKey = `${config.prefsPrefix}.enableCodexAppServerMode`;
+        let claudeObserverId: symbol | undefined;
+        let codexObserverId: symbol | undefined;
+        const unregister = () => {
+          for (const observerId of [claudeObserverId, codexObserverId]) {
+            if (observerId === undefined) continue;
+            try {
+              (Zotero as any).Prefs.unregisterObserver(observerId);
+            } catch {
+              void 0;
+            }
+          }
+          claudeObserverId = undefined;
+          codexObserverId = undefined;
+        };
+        cleanupStandalonePrefObserver = unregister;
+        const onClaudeModePrefChange = () => {
+          if (cancelled || newWin.closed) {
+            unregister();
+            return;
+          }
+          if (!getClaudeCodeModeEnabled()) {
+            void releaseClaudeRuntimeForBody(contentArea as Element);
+            void initAgentSubsystem()
+              .then((coreRuntime) =>
+                invalidateAllClaudeHotRuntimes(coreRuntime),
+              )
+              .catch((err) => {
+                appLogger.warn(
+                  "LLM: Failed to invalidate all Claude hot runtimes",
+                  err,
+                );
+              });
+            if (getConversationSystemPref() === "claude_code") {
+              setConversationSystemPref("upstream");
+            }
+            if (isClaudeConversationSystem()) {
+              void switchConversationSystem("upstream");
+              return;
+            }
+          }
+          updateStandaloneSystemToggles();
+        };
+        const onCodexModePrefChange = () => {
+          if (cancelled || newWin.closed) {
+            unregister();
+            return;
+          }
+          if (!isCodexAppServerModeEnabled()) {
+            if (getConversationSystemPref() === "codex") {
+              setConversationSystemPref("upstream");
+            }
+            if (isCodexConversationSystem()) {
+              void switchConversationSystem("upstream");
+              return;
+            }
+          }
+          updateStandaloneSystemToggles();
+        };
+        try {
+          claudeObserverId = (Zotero as any).Prefs.registerObserver(
+            claudeModePrefKey,
+            onClaudeModePrefChange,
+            true,
+          );
+          codexObserverId = (Zotero as any).Prefs.registerObserver(
+            codexModePrefKey,
+            onCodexModePrefChange,
+            true,
+          );
+        } catch {
+          void 0;
+        }
+      }
+
+      const commitStandaloneMode = (mode: "open" | "paper") => {
+        standaloneMode = mode;
+        if (isClaudeConversationSystem()) {
+          setLastUsedClaudeConversationMode(
+            getCurrentLibraryScopeID(),
+            mode === "open" ? "global" : "paper",
+          );
+        } else if (isCodexConversationSystem()) {
+          setLastUsedCodexConversationMode(
+            getCurrentLibraryScopeID(),
+            mode === "open" ? "global" : "paper",
+          );
+        } else {
+          setLastUsedUpstreamConversationMode(
+            getCurrentLibraryScopeID(),
+            mode === "open" ? "global" : "paper",
+          );
+        }
+        paperTab.classList.toggle("active", mode === "paper");
+        openTab.classList.toggle("active", mode === "open");
+      };
+
+      const showNoPaperChatSourceStatus = () => {
+        setStandaloneHistoryStatus(
+          t("Open a supported Zotero document to start a paper chat"),
+          "error",
+        );
+      };
+
+      const resolvePaperSwitchTarget = (
+        rawItem: Zotero.Item | null,
+      ): {
+        rawItem: Zotero.Item | null;
+        paperItem: Zotero.Item | null;
+        panelItem: Zotero.Item | null;
+      } => {
+        const resolved = resolveInitialPanelItemState(rawItem, {
+          conversationSystem: currentConversationSystem,
+          conversationMode: "paper",
+        });
+        const paperItem =
+          resolved.basePaperItem ||
+          (rawItem ? resolvePaperChatSourceItem(rawItem) : null);
+        return {
+          rawItem,
+          paperItem,
+          panelItem: resolved.item || paperItem,
+        };
+      };
+
+      const mountRememberedStandalonePaperConversation = (params: {
+        paperItem: Zotero.Item;
+        panelItem?: Zotero.Item | null;
+        rawItem?: Zotero.Item | null;
+      }): boolean => {
+        const paperLibraryID = getLibraryIDForPaperItem(params.paperItem);
+        const paperId = Number(params.paperItem.id || 0);
+        if (
+          !Number.isFinite(paperLibraryID) ||
+          paperLibraryID <= 0 ||
+          !Number.isFinite(paperId) ||
+          paperId <= 0
+        ) {
+          return false;
+        }
+        const nextItem = params.panelItem || params.paperItem;
+        if (cancelled) return false;
+        currentRawContextItem = params.rawItem || params.paperItem;
+        currentBasePaperItem = params.paperItem;
+        currentPaperItem = nextItem;
+        commitStandaloneMode("paper");
+        mountChatPanel(nextItem, currentRawContextItem);
+        scheduleStandaloneSidebarRender();
+        return true;
+      };
+
+      const switchToMode = async (mode: "open" | "paper") => {
+        try {
+          // [webchat] If in webchat mode and user clicks "Library chat", exit webchat first
+          if (isInWebChatMode && mode === "open") {
+            const clearBtnEl = contentArea.querySelector(
+              "#llm-clear",
+            ) as HTMLElement | null;
+            if (clearBtnEl) clearBtnEl.click();
+          }
+          if (isInWebChatMode && mode === "paper") return;
+          if (mode === standaloneMode) return;
+
+          if (mode === "open") {
+            const rememberedItem = resolveRememberedGlobalPanelItem(
+              getCurrentLibraryScopeID(),
+              currentConversationSystem,
+            );
+            const key = rememberedItem ? getConversationKey(rememberedItem) : 0;
+            if (!key) return;
+            commitStandaloneMode("open");
+            mountStandaloneOpenConversation(key);
+            return;
+          }
+
+          const rawItem =
+            getSelectedZoteroItem() ||
+            currentRawContextItem ||
+            currentBasePaperItem ||
+            currentPaperItem;
+          const target = resolvePaperSwitchTarget(rawItem);
+          if (!target.paperItem) {
+            showNoPaperChatSourceStatus();
+            return;
+          }
+          const mounted = mountRememberedStandalonePaperConversation({
+            paperItem: target.paperItem,
+            panelItem: target.panelItem,
+            rawItem: target.rawItem,
+          });
+          if (!mounted) {
+            showNoPaperChatSourceStatus();
+          }
+        } catch (err) {
+          appLogger.warn("LLM: standalone mode switch failed", err);
+          if (mode === "paper") showNoPaperChatSourceStatus();
+        }
+      };
+
+      paperTab.addEventListener("click", () => {
+        void switchToMode("paper");
+      });
+      openTab.addEventListener("click", () => {
+        void switchToMode("open");
+      });
+
+      // Auto-collapse sidebar when window is narrow, respecting manual override.
+      // ResizeObserver is unavailable in some Gecko/XUL window contexts —
+      // fall back to a simple resize event listener.
+      let lastAutoState: "expanded" | "collapsed" | null = null;
+      let lastAutoWidth: number | null = null;
+      const resolveAutoSidebarState = (width: number) => {
+        let autoState: "expanded" | "collapsed" =
+          lastAutoState ||
+          (width < STANDALONE_SIDEBAR_AUTO_COLLAPSE_THRESHOLD_PX
+            ? "collapsed"
+            : "expanded");
+        if (
+          lastAutoWidth !== null &&
+          width < lastAutoWidth &&
+          width < STANDALONE_SIDEBAR_AUTO_COLLAPSE_THRESHOLD_PX
+        ) {
+          autoState = "collapsed";
+        } else if (
+          lastAutoWidth !== null &&
+          width > lastAutoWidth &&
+          width > STANDALONE_SIDEBAR_AUTO_EXPAND_THRESHOLD_PX
+        ) {
+          autoState = "expanded";
+        } else if (
+          lastAutoWidth === null &&
+          width >= STANDALONE_SIDEBAR_AUTO_COLLAPSE_THRESHOLD_PX
+        ) {
+          autoState = "expanded";
+        }
+        lastAutoWidth = width;
+        return autoState;
+      };
+      const applyAutoSidebarState = (width: number) => {
+        const autoState = resolveAutoSidebarState(width);
+        if (userManualSidebarState !== null) {
+          if (lastAutoState !== null && autoState !== lastAutoState) {
+            userManualSidebarState = null;
+            setSidebarState(autoState);
+          }
+        } else {
+          setSidebarState(autoState);
+        }
+        lastAutoState = autoState;
+      };
+      const handleResize = () => {
+        applyAutoSidebarState(root.clientWidth || 0);
+      };
+      const RO =
+        (newWin as any).ResizeObserver || (globalThis as any).ResizeObserver;
+      if (RO) {
+        const resizeObserver = new RO((entries: any[]) => {
+          const width = entries[0]?.contentRect?.width || root.clientWidth || 0;
+          applyAutoSidebarState(width);
+        });
+        resizeObserver.observe(root);
+      } else {
+        newWin.addEventListener("resize", handleResize);
+        handleResize();
+      }
+
+      // Cmd/Ctrl+W to close the standalone window
+      newWin.addEventListener("keydown", (e: KeyboardEvent) => {
+        const isMac = (Zotero as any).isMac;
+        if ((isMac ? e.metaKey : e.ctrlKey) && e.key === "w") {
+          e.preventDefault();
+          newWin.close();
+        }
+      });
+
+      // Listen for paper tab changes in the main Zotero window.
+      // When the user switches to a different paper, update the standalone chat.
+      standaloneItemChangeHandler = (rawItem: Zotero.Item | null) => {
+        if (cancelled || standaloneMode !== "paper") return;
+        const target = resolvePaperSwitchTarget(rawItem);
+        const newBasePaper = target.paperItem;
+        if (!newBasePaper) {
+          currentRawContextItem = rawItem;
+          currentBasePaperItem = null;
+          currentPaperItem = null;
+          syncPaperTabLabel();
+          void restoreStandaloneOpenConversation(false).then(() => {
+            if (!cancelled) showNoPaperChatSourceStatus();
+          });
+          return;
+        }
+        // Skip if same paper
+        const newPaperID = Number(newBasePaper.id || 0);
+        const oldPaperID = Number(currentBasePaperItem?.id || 0);
+        if (newPaperID > 0 && newPaperID === oldPaperID) {
+          const newRawContextID = Number(rawItem?.id || 0);
+          const oldRawContextID = Number(currentRawContextItem?.id || 0);
+          if (newRawContextID > 0 && newRawContextID !== oldRawContextID) {
+            currentRawContextItem = rawItem;
+            mountChatPanel(
+              target.panelItem ||
+                activeItem ||
+                currentPaperItem ||
+                newBasePaper,
+              rawItem,
+            );
+            scheduleStandaloneSidebarRender();
+          }
+          return;
+        }
+        // Switch to the new paper
+        const mounted = mountRememberedStandalonePaperConversation({
+          paperItem: newBasePaper,
+          panelItem: target.panelItem,
+          rawItem: target.rawItem || newBasePaper,
+        });
+        if (!mounted && !cancelled) {
+          void restoreStandaloneOpenConversation(false).then(() => {
+            if (!cancelled) showNoPaperChatSourceStatus();
+          });
+        }
+      };
+
+      // Initial mount preserves the current paper/library conversation. The
+      // only automatic blank draft is created once during Zotero startup.
+      appLogger.debug(
+        "LLM: standalone mounting initial item",
+        "mode=" + standaloneMode,
+        "itemId=" + (initialMountedItem?.id ?? "null"),
+        "convKey=" + getConversationKey(initialMountedItem),
+      );
+      mountChatPanel(initialMountedItem, currentRawContextItem);
+      appLogger.debug(
+        "LLM: standalone renderSidebar start",
+        "mode=" + standaloneMode,
+      );
+      scheduleStandaloneSidebarRender();
+      renderStandalonePlaceholdersInEmbeddedPanels(contentArea);
+    } catch (err) {
+      appLogger.warn("LLM: standalone initWindow failed", err);
+      // Show a visible error so the window isn't silently blank
+      try {
+        const root = newWin.document?.getElementById(
+          "llmforzotero-standalone-chat-root",
+        );
+        const target = root || newWin.document?.body;
+        if (target) {
+          const msg = newWin.document.createElementNS(
+            HTML_NS,
+            "div",
+          ) as HTMLDivElement;
+          msg.style.cssText =
+            "display:flex;align-items:center;justify-content:center;" +
+            "height:100%;color:#f87171;font-size:14px;padding:24px;text-align:center;";
+          msg.textContent =
+            "Failed to initialize chat window. Check the error console for details.";
+          target.appendChild(msg);
+        }
+      } catch {
+        /* ignore fallback errors */
+      }
+    }
+  };
+
+  const cleanupWindow = () => {
+    cancelled = true;
+    disposeHistoryActivity?.();
+    disposeHistoryActivity = null;
+    unsubscribeStandalonePendingDeletions?.();
+    unsubscribeStandalonePendingDeletions = null;
+    cleanupStandalonePrefObserver?.();
+    cleanupStandaloneVerticalResize?.();
+    cleanupStandaloneVerticalResize = null;
+    cleanupStandaloneSidebarResize?.();
+    cleanupStandaloneSidebarResize = null;
+    cleanupStandaloneSidebarFlyout?.();
+    cleanupStandaloneSidebarFlyout = null;
+    standaloneItemChangeHandler = null;
+    themeObserver?.disconnect();
+    themeObserver = null;
+    if (enforceStandaloneMinimumSize) {
+      newWin.removeEventListener("resize", enforceStandaloneMinimumSize);
+    }
+    enforceStandaloneMinimumSize = null;
+    if (darkMQ && onSchemeChange) {
+      darkMQ.removeEventListener("change", onSchemeChange);
+    }
+    darkMQ = null;
+    onSchemeChange = null;
+    if (standaloneAttachmentGcTimer !== null) {
+      newWin.clearTimeout(standaloneAttachmentGcTimer);
+      standaloneAttachmentGcTimer = null;
+    }
+    setStandalonePending(false);
+    // Remove the standalone window's content area from panel tracking
+    const root = newWin.document?.getElementById(
+      "llmforzotero-standalone-chat-root",
+    );
+    const contentArea = root?.querySelector(".llm-standalone-content");
+    if (contentArea) {
+      disposeSetupHandlers(contentArea);
+      clearPanelHostBinding(contentArea);
+      void releaseClaudeRuntimeForBody(contentArea as Element);
+      unregisterContextPanel(contentArea);
+    }
+    const sessionWin = getStandaloneSessionWindow();
+    if (sessionWin === newWin || sessionWin === null) {
+      setStandaloneSessionWindow(null);
+    }
+    restoreEmbeddedPanelsAfterStandaloneClose(contentArea as Element | null);
+  };
+
+  newWin.addEventListener("load", initWindow, { once: true });
+  // Note: unload is registered inside initWindow to avoid the XUL
+  // about:blank → document transition firing a premature unload.
+}

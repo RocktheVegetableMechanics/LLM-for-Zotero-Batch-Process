@@ -1,0 +1,133 @@
+import { assert } from "chai";
+import {
+  getModelOutputTokenLimit,
+  normalizeInputTokenCap,
+  normalizeMaxTokens,
+  normalizeMaxTokensForModel,
+  normalizeOptionalInputTokenCap,
+  normalizeTemperature,
+} from "../src/utils/normalization";
+import {
+  DEFAULT_INPUT_TOKEN_CAP,
+  DEFAULT_CUSTOM_OUTPUT_TOKEN_LIMIT,
+  DEFAULT_TEMPERATURE,
+  MAX_ALLOWED_INPUT_TOKEN_CAP,
+  MAX_ALLOWED_TOKENS,
+} from "../src/utils/llmDefaults";
+
+describe("normalization", function () {
+  describe("normalizeTemperature", function () {
+    it("should use default temperature for invalid input", function () {
+      assert.equal(normalizeTemperature(undefined), DEFAULT_TEMPERATURE);
+      assert.equal(normalizeTemperature(""), DEFAULT_TEMPERATURE);
+      assert.equal(normalizeTemperature("not-a-number"), DEFAULT_TEMPERATURE);
+    });
+
+    it("should clamp to [0, 2]", function () {
+      assert.equal(normalizeTemperature(-1), 0);
+      assert.equal(normalizeTemperature(3), 2);
+      assert.equal(normalizeTemperature(1.5), 1.5);
+      assert.equal(normalizeTemperature("0.25"), 0.25);
+    });
+  });
+
+  describe("normalizeMaxTokens", function () {
+    it("uses the explicit Custom seed for invalid Custom input", function () {
+      assert.equal(
+        normalizeMaxTokens(undefined),
+        DEFAULT_CUSTOM_OUTPUT_TOKEN_LIMIT,
+      );
+      assert.equal(normalizeMaxTokens(0), DEFAULT_CUSTOM_OUTPUT_TOKEN_LIMIT);
+      assert.equal(normalizeMaxTokens(""), DEFAULT_CUSTOM_OUTPUT_TOKEN_LIMIT);
+      assert.equal(
+        normalizeMaxTokens("abc"),
+        DEFAULT_CUSTOM_OUTPUT_TOKEN_LIMIT,
+      );
+    });
+
+    it("should clamp to [1, MAX_ALLOWED_TOKENS]", function () {
+      assert.equal(normalizeMaxTokens(1), 1);
+      assert.equal(normalizeMaxTokens("42"), 42);
+      assert.equal(
+        normalizeMaxTokens(MAX_ALLOWED_TOKENS + 99),
+        MAX_ALLOWED_TOKENS,
+      );
+    });
+  });
+
+  describe("normalizeMaxTokensForModel", function () {
+    it("uses the DeepSeek V4 output limit for V4 models and aliases", function () {
+      assert.equal(getModelOutputTokenLimit("deepseek-v4-pro"), 384000);
+      assert.equal(
+        getModelOutputTokenLimit("deepseek/deepseek-v4-flash"),
+        384000,
+      );
+      assert.equal(getModelOutputTokenLimit("deepseek-reasoner"), 384000);
+      assert.equal(
+        normalizeMaxTokensForModel(400000, "deepseek-v4-pro"),
+        384000,
+      );
+    });
+
+    it("keeps the default output limit for unknown models", function () {
+      assert.equal(
+        normalizeMaxTokensForModel(MAX_ALLOWED_TOKENS + 99, "custom-model"),
+        MAX_ALLOWED_TOKENS,
+      );
+    });
+
+    it("uses documented output limits for current Anthropic models", function () {
+      assert.equal(getModelOutputTokenLimit("claude-opus-4-7"), 128000);
+      assert.equal(
+        getModelOutputTokenLimit("anthropic.claude-opus-4-6"),
+        128000,
+      );
+      assert.equal(getModelOutputTokenLimit("claude-sonnet-4-6"), 64000);
+      assert.equal(getModelOutputTokenLimit("claude-haiku-4-5"), 64000);
+      assert.equal(
+        normalizeMaxTokensForModel(200000, "claude-opus-4-7"),
+        128000,
+      );
+    });
+  });
+
+  describe("normalizeInputTokenCap", function () {
+    it("should use default cap for invalid input", function () {
+      assert.equal(normalizeInputTokenCap(undefined), DEFAULT_INPUT_TOKEN_CAP);
+      assert.equal(normalizeInputTokenCap(0), DEFAULT_INPUT_TOKEN_CAP);
+      assert.equal(normalizeInputTokenCap(""), DEFAULT_INPUT_TOKEN_CAP);
+      assert.equal(normalizeInputTokenCap("abc"), DEFAULT_INPUT_TOKEN_CAP);
+    });
+
+    it("should clamp to [1, MAX_ALLOWED_INPUT_TOKEN_CAP]", function () {
+      assert.equal(normalizeInputTokenCap(1), 1);
+      assert.equal(normalizeInputTokenCap("2048"), 2048);
+      assert.equal(
+        normalizeInputTokenCap(MAX_ALLOWED_INPUT_TOKEN_CAP + 99),
+        MAX_ALLOWED_INPUT_TOKEN_CAP,
+      );
+    });
+
+    it("should honor a valid custom fallback", function () {
+      assert.equal(normalizeInputTokenCap(undefined, 200000), 200000);
+    });
+  });
+
+  describe("normalizeOptionalInputTokenCap", function () {
+    it("should return undefined for blank or invalid input", function () {
+      assert.isUndefined(normalizeOptionalInputTokenCap(undefined));
+      assert.isUndefined(normalizeOptionalInputTokenCap(""));
+      assert.isUndefined(normalizeOptionalInputTokenCap("abc"));
+      assert.isUndefined(normalizeOptionalInputTokenCap(0));
+    });
+
+    it("should clamp valid values", function () {
+      assert.equal(normalizeOptionalInputTokenCap(1), 1);
+      assert.equal(normalizeOptionalInputTokenCap("2048"), 2048);
+      assert.equal(
+        normalizeOptionalInputTokenCap(MAX_ALLOWED_INPUT_TOKEN_CAP + 99),
+        MAX_ALLOWED_INPUT_TOKEN_CAP,
+      );
+    });
+  });
+});
