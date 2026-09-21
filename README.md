@@ -1,6 +1,6 @@
 # LLM-for-Zotero Batch Process
 
-这是基于 [yilewang/llm-for-zotero](https://github.com/yilewang/llm-for-zotero) 修改的批量论文处理版本，归档版本为 **3.9.6.12**，修改及归档日期为 2026-09-15。原项目作者为 Yile Wang。本项目为出于自用目的的独立修改版。
+这是基于 [yilewang/llm-for-zotero](https://github.com/yilewang/llm-for-zotero) 修改的批量论文处理版本，归档版本为 **3.9.9.1**，修改及归档日期为 2026-09-21。原项目作者为 Yile Wang。本项目为出于自用目的的独立修改版。
 
 添加功能：一次选中多篇 Zotero 文献，用同一个提示词依次处理，并把每篇论文的结果分别保存到对应的“论文会话”中。这样可以把一批论文交给插件顺序处理，不需要始终守在窗口前，之后也能回到各篇论文继续查看结果。
 
