@@ -6,7 +6,7 @@
 
 ## 下载与安装
 
-安装包位于：[`dist/llm-for-zotero-3.9.6.12-document-source-fix.xpi`](dist/llm-for-zotero-3.9.6.12-document-source-fix.xpi)。
+安装包位于[`dist`]目录下。
 
 在 Zotero 中打开“工具 → 插件”，点击齿轮菜单并选择“从文件安装插件”，然后选择上述 XPI，按提示重启 Zotero 即可。插件 ID 沿用上游版本，因此安装时会替换已经安装的同 ID 插件。更新前如果队列里还有尚未处理的任务，建议先处理完或自行记录。
 
@@ -40,48 +40,6 @@
 - 为 Codex 语义解释保留更合理的等待时间，并改进 `actions`、`skill_binding` 解析失败后的纠正重试和诊断；写入授权检查没有取消。
 - 对特定输入流中断提供一次有界恢复，同时调整 Zotero MCP 工具的等待时间和预检缓存，减少长篇读取超过 300 秒后失败的情况。
 - 调整委托操作的状态显示。模型列表会适配服务器实际返回的可用型号，但插件本身不会让旧服务器获得原本不支持的模型。
-
-## 验证与限制
-
-最终版本曾使用 **GPT-5.6 Sol / Low** 和原始自定义长提示词连续处理两篇论文。实测确认队列能够自动进入下一篇，结果能够持久保存，并且重新打开对应论文会话后仍可访问。最终归档版没有再次进行 Luna / Max 实测。
-
-文档来源校验的原始报错已经通过真实函数回归测试复现，并验证了对应修复。上述模型实测只代表已经覆盖的实际使用路径，并不意味着所有模型和所有生成路径都经过完整测试。自动测试使用模拟的 Zotero、DOM 和模型环境，不会操作真实文库，也不会调用付费 API。
-
-**当前队列只保存在内存中。** 如果关闭 Zotero 窗口或更新插件，尚未执行的队列条目会丢失；已经保存到论文会话中的结果不会受到影响。这个版本暂未实现重启后的队列恢复。
-
-`manifest.json` 仍然使用上游的自动更新地址。因此安装本修改版后，建议在 Zotero 插件管理界面中留意自动更新设置，避免后续被上游版本直接覆盖。
-
-## 目录与源码说明
-
-```text
-README.md
-LICENSE                         上游 AGPL v3 许可证
-NOTICE.md                       来源与修改说明
-src/extension/                  当前插件完整展开目录
-  content/scripts/llmforzotero.js  实际修改的可读 JavaScript bundle
-  manifest.json                 插件元数据及版本
-  content/、locale/、scripts/等   插件运行所需的其他资源
-dist/                          已验证的 XPI 安装包
-tests/                         9 个离线回归测试
-tests/fixtures/                原发行版脚本，仅用于复现修改前行为
-scripts/build.ps1              重新打包 XPI
-scripts/test.ps1               语法检查及回归测试
-```
-
-这里保存的是本次实际编辑、运行和打包所使用的 JavaScript 与相关资源，**并不是上游完整的 TypeScript 开发仓库**。如果只是重新打包当前版本，不需要执行 `npm install`，也不需要重新编译上游工程。需要完整 TypeScript 源码时，请直接查看上游仓库；当前上游 `main` 也不能视为这个归档包的精确构建来源。
-
-`tests/fixtures/original-llmforzotero.js` 保存了修改前的发行版脚本，用于流恢复、MCP 和文档来源等回归测试的对照。两项包含私人故障记录的旧测试没有放入公开归档。仓库中也不包含 Zotero 数据库、个人会话、队列清单、API 密钥或私人提示词。
-
-## 测试与打包
-
-在仓库根目录打开 PowerShell 即可运行测试和重新打包。测试需要 Node.js（归档时使用 v24.19.0）；打包使用 PowerShell/.NET：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\test.ps1
-powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
-```
-
-重新打包后会生成 `build/llm-for-zotero-3.9.6.12.xpi`，不会覆盖 `dist/` 中保存的已验证安装包。重新生成的 ZIP/XPI 压缩字节可能不同，但插件文件内容相同。
 
 ## 来源与许可证
 
